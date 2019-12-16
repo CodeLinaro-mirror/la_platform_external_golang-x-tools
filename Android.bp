@@ -1,0 +1,11 @@
+// Version control API.
+bootstrap_go_package {
+    name: "golang-x-tools-go-vcs",
+    pkgPath: "golang.org/x/tools/go/vcs",
+    srcs: [
+        "go/vcs/discovery.go",
+        "go/vcs/env.go",
+        "go/vcs/http.go",
+        "go/vcs/vcs.go",
+    ],
+}
