@@ -2,6 +2,7 @@
 bootstrap_go_package {
     name: "golang-x-tools-go-vcs",
     pkgPath: "golang.org/x/tools/go/vcs",
+    deps: ["golang.org-x-sys-execabs"],
     srcs: [
         "go/vcs/discovery.go",
         "go/vcs/env.go",

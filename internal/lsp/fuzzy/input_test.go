@@ -36,20 +36,12 @@ func rolesString(roles []fuzzy.RuneRole) string {
 func TestRoles(t *testing.T) {
 	for _, tc := range rolesTests {
 		gotRoles := make([]fuzzy.RuneRole, len(tc.str))
-		fuzzy.RuneRoles(tc.str, gotRoles)
+		fuzzy.RuneRoles([]byte(tc.str), gotRoles)
 		got := rolesString(gotRoles)
 		if got != tc.want {
 			t.Errorf("roles(%s) = %v; want %v", tc.str, got, tc.want)
 		}
 	}
-}
-
-func words(strWords ...string) [][]byte {
-	var ret [][]byte
-	for _, w := range strWords {
-		ret = append(ret, []byte(w))
-	}
-	return ret
 }
 
 var wordSplitTests = []struct {
@@ -76,7 +68,7 @@ var wordSplitTests = []struct {
 
 func TestWordSplit(t *testing.T) {
 	for _, tc := range wordSplitTests {
-		roles := fuzzy.RuneRoles(tc.input, nil)
+		roles := fuzzy.RuneRoles([]byte(tc.input), nil)
 
 		var got []string
 		consumer := func(i, j int) {
@@ -128,7 +120,7 @@ var lastSegmentSplitTests = []struct {
 
 func TestLastSegment(t *testing.T) {
 	for _, tc := range lastSegmentSplitTests {
-		roles := fuzzy.RuneRoles(tc.str, nil)
+		roles := fuzzy.RuneRoles([]byte(tc.str), nil)
 
 		got := fuzzy.LastSegment(tc.str, roles)
 
@@ -143,7 +135,7 @@ func BenchmarkRoles(b *testing.B) {
 	out := make([]fuzzy.RuneRole, len(str))
 
 	for i := 0; i < b.N; i++ {
-		fuzzy.RuneRoles(str, out)
+		fuzzy.RuneRoles([]byte(str), out)
 	}
 	b.SetBytes(int64(len(str)))
 }

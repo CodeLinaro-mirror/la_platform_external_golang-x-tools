@@ -1,3 +1,7 @@
+// Copyright 2019 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
 package imports
 
 import (
@@ -68,7 +72,6 @@ func TestModCacheInfo(t *testing.T) {
 				status:                 directoryScanned,
 				dir:                    "mypackage",
 				nonCanonicalImportPath: "example.com/mypackage",
-				needsReplace:           false,
 			},
 		},
 		{
@@ -83,7 +86,6 @@ func TestModCacheInfo(t *testing.T) {
 			info: directoryPackageInfo{
 				dir:                    "mypackage/other",
 				nonCanonicalImportPath: "example.com/mypackage/other",
-				needsReplace:           false,
 			},
 		},
 	}
