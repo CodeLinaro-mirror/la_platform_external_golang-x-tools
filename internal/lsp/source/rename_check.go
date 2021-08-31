@@ -7,7 +7,6 @@
 package source
 
 import (
-	"context"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -121,10 +120,12 @@ func (r *renamer) checkInPackageBlock(from types.Object) {
 		fileScope := pkg.GetTypesInfo().Scopes[f]
 		b, prev := fileScope.LookupParent(r.to, token.NoPos)
 		if b == fileScope {
-			r.errorf(from.Pos(), "renaming this %s %q to %q would conflict",
-				objectKind(from), from.Name(), r.to)
-			r.errorf(prev.Pos(), "\twith this %s",
-				objectKind(prev))
+			r.errorf(from.Pos(), "renaming this %s %q to %q would conflict", objectKind(from), from.Name(), r.to)
+			var prevPos token.Pos
+			if prev != nil {
+				prevPos = prev.Pos()
+			}
+			r.errorf(prevPos, "\twith this %s", objectKind(prev))
 			return // since checkInPackageBlock would report redundant errors
 		}
 	}
@@ -193,8 +194,8 @@ func (r *renamer) checkInLexicalScope(from types.Object, pkg Package) {
 			// Check for super-block conflict.
 			// The name r.to is defined in a superblock.
 			// Is that name referenced from within this block?
-			forEachLexicalRef(r.ctx, pkg, to, func(id *ast.Ident, block *types.Scope) bool {
-				_, obj := lexicalLookup(block, from.Name(), id.Pos())
+			forEachLexicalRef(pkg, to, func(id *ast.Ident, block *types.Scope) bool {
+				_, obj := block.LookupParent(from.Name(), id.Pos())
 				if obj == from {
 					// super-block conflict
 					r.errorf(from.Pos(), "renaming this %s %q to %q",
@@ -211,13 +212,12 @@ func (r *renamer) checkInLexicalScope(from types.Object, pkg Package) {
 	// Check for sub-block conflict.
 	// Is there an intervening definition of r.to between
 	// the block defining 'from' and some reference to it?
-	forEachLexicalRef(r.ctx, pkg, from, func(id *ast.Ident, block *types.Scope) bool {
+	forEachLexicalRef(pkg, from, func(id *ast.Ident, block *types.Scope) bool {
 		// Find the block that defines the found reference.
 		// It may be an ancestor.
-		fromBlock, _ := lexicalLookup(block, from.Name(), id.Pos())
-
+		fromBlock, _ := block.LookupParent(from.Name(), id.Pos())
 		// See what r.to would resolve to in the same scope.
-		toBlock, to := lexicalLookup(block, r.to, id.Pos())
+		toBlock, to := block.LookupParent(r.to, id.Pos())
 		if to != nil {
 			// sub-block conflict
 			if deeper(toBlock, fromBlock) {
@@ -248,23 +248,6 @@ func (r *renamer) checkInLexicalScope(from types.Object, pkg Package) {
 	}
 }
 
-// lexicalLookup is like (*types.Scope).LookupParent but respects the
-// environment visible at pos.  It assumes the relative position
-// information is correct with each file.
-func lexicalLookup(block *types.Scope, name string, pos token.Pos) (*types.Scope, types.Object) {
-	for b := block; b != nil; b = b.Parent() {
-		obj := b.Lookup(name)
-		// The scope of a package-level object is the entire package,
-		// so ignore pos in that case.
-		// No analogous clause is needed for file-level objects
-		// since no reference can appear before an import decl.
-		if obj != nil && (b == obj.Pkg().Scope() || obj.Pos() < pos) {
-			return b, obj
-		}
-	}
-	return nil, nil
-}
-
 // deeper reports whether block x is lexically deeper than y.
 func deeper(x, y *types.Scope) bool {
 	if x == y || x == nil {
@@ -280,7 +263,7 @@ func deeper(x, y *types.Scope) bool {
 // pkg that is a reference to obj in lexical scope.  block is the
 // lexical block enclosing the reference.  If fn returns false the
 // iteration is terminated and findLexicalRefs returns false.
-func forEachLexicalRef(ctx context.Context, pkg Package, obj types.Object, fn func(id *ast.Ident, block *types.Scope) bool) bool {
+func forEachLexicalRef(pkg Package, obj types.Object, fn func(id *ast.Ident, block *types.Scope) bool) bool {
 	ok := true
 	var stack []ast.Node
 
@@ -313,8 +296,11 @@ func forEachLexicalRef(ctx context.Context, pkg Package, obj types.Object, fn fu
 		case *ast.CompositeLit:
 			// Handle recursion ourselves for struct literals
 			// so we don't visit field identifiers.
-			tv := pkg.GetTypesInfo().Types[n]
-			if _, ok := deref(tv.Type).Underlying().(*types.Struct); ok {
+			tv, ok := pkg.GetTypesInfo().Types[n]
+			if !ok {
+				return visit(nil) // pop stack, don't descend
+			}
+			if _, ok := Deref(tv.Type).Underlying().(*types.Struct); ok {
 				if n.Type != nil {
 					ast.Inspect(n.Type, visit)
 				}
@@ -383,7 +369,11 @@ func (r *renamer) checkStructField(from *types.Var) {
 	// go/types offers no easy way to get from a field (or interface
 	// method) to its declaring struct (or interface), so we must
 	// ascend the AST.
-	pkg, path, _ := pathEnclosingInterval(r.ctx, r.fset, r.packages[from.Pkg()], from.Pos(), from.Pos())
+	fromPkg, ok := r.packages[from.Pkg()]
+	if !ok {
+		return
+	}
+	pkg, path, _ := pathEnclosingInterval(r.fset, fromPkg, from.Pos(), from.Pos())
 	if pkg == nil || path == nil {
 		return
 	}
@@ -443,7 +433,7 @@ func (r *renamer) checkStructField(from *types.Var) {
 	if from.Anonymous() {
 		if named, ok := from.Type().(*types.Named); ok {
 			r.check(named.Obj())
-		} else if named, ok := deref(from.Type()).(*types.Named); ok {
+		} else if named, ok := Deref(from.Type()).(*types.Named); ok {
 			r.check(named.Obj())
 		}
 	}
@@ -497,7 +487,6 @@ func (r *renamer) checkSelections(from types.Object) {
 					r.selectionConflict(from, delta, syntax, obj)
 					return
 				}
-
 			} else if sel.Obj().Name() == r.to {
 				if obj, indices, _ := types.LookupFieldOrMethod(sel.Recv(), isAddressable, from.Pkg(), from.Name()); obj == from {
 					// Renaming 'from' may cause this existing
@@ -564,7 +553,7 @@ func (r *renamer) checkMethod(from *types.Func) {
 	// Check for conflict at point of declaration.
 	// Check to ensure preservation of assignability requirements.
 	R := recv(from).Type()
-	if isInterface(R) {
+	if IsInterface(R) {
 		// Abstract method
 
 		// declaration
@@ -581,7 +570,7 @@ func (r *renamer) checkMethod(from *types.Func) {
 		for _, pkg := range r.packages {
 			// Start with named interface types (better errors)
 			for _, obj := range pkg.GetTypesInfo().Defs {
-				if obj, ok := obj.(*types.TypeName); ok && isInterface(obj.Type()) {
+				if obj, ok := obj.(*types.TypeName); ok && IsInterface(obj.Type()) {
 					f, _, _ := types.LookupFieldOrMethod(
 						obj.Type(), false, from.Pkg(), from.Name())
 					if f == nil {
@@ -653,7 +642,7 @@ func (r *renamer) checkMethod(from *types.Func) {
 			// yields abstract method I.f.  This can make error
 			// messages less than obvious.
 			//
-			if !isInterface(key.RHS) {
+			if !IsInterface(key.RHS) {
 				// The logic below was derived from checkSelections.
 
 				rtosel := rmethods.Lookup(from.Pkg(), r.to)
@@ -728,7 +717,7 @@ func (r *renamer) checkMethod(from *types.Func) {
 		//
 		for key := range r.satisfy() {
 			// key = (lhs, rhs) where lhs is always an interface.
-			if isInterface(key.RHS) {
+			if IsInterface(key.RHS) {
 				continue
 			}
 			rsel := r.msets.MethodSet(key.RHS).Lookup(from.Pkg(), from.Name())
@@ -802,7 +791,7 @@ func (r *renamer) satisfy() map[satisfy.Constraint]bool {
 			// type-checker.
 			//
 			// Only proceed if all packages have no errors.
-			if errs := pkg.GetErrors(); len(errs) > 0 {
+			if pkg.HasListOrParseErrors() || pkg.HasTypeErrors() {
 				r.errorf(token.NoPos, // we don't have a position for this error.
 					"renaming %q to %q not possible because %q has errors",
 					r.from, r.to, pkg.PkgPath())
@@ -839,8 +828,8 @@ func someUse(info *types.Info, obj types.Object) *ast.Ident {
 //
 // The zero value is returned if not found.
 //
-func pathEnclosingInterval(ctx context.Context, fset *token.FileSet, pkg Package, start, end token.Pos) (resPkg Package, path []ast.Node, exact bool) {
-	var pkgs = []Package{pkg}
+func pathEnclosingInterval(fset *token.FileSet, pkg Package, start, end token.Pos) (resPkg Package, path []ast.Node, exact bool) {
+	pkgs := []Package{pkg}
 	for _, f := range pkg.GetSyntax() {
 		for _, imp := range f.Imports {
 			if imp == nil {
@@ -884,6 +873,9 @@ func tokenFileContainsPos(f *token.File, pos token.Pos) bool {
 }
 
 func objectKind(obj types.Object) string {
+	if obj == nil {
+		return "nil object"
+	}
 	switch obj := obj.(type) {
 	case *types.PkgName:
 		return "imported package name"
@@ -927,11 +919,10 @@ func isLocal(obj types.Object) bool {
 }
 
 func isPackageLevel(obj types.Object) bool {
+	if obj == nil {
+		return false
+	}
 	return obj.Pkg().Scope().Lookup(obj.Name()) == obj
-}
-
-func isInterface(T types.Type) bool {
-	return T != nil && types.IsInterface(T)
 }
 
 // -- Plundered from go/scanner: ---------------------------------------

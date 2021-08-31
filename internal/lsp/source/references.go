@@ -7,19 +7,20 @@ package source
 import (
 	"context"
 	"go/ast"
+	"go/token"
 	"go/types"
+	"sort"
 
-	"golang.org/x/tools/go/types/objectpath"
-	"golang.org/x/tools/internal/lsp/telemetry"
-	"golang.org/x/tools/internal/telemetry/log"
-	"golang.org/x/tools/internal/telemetry/trace"
+	"golang.org/x/tools/internal/event"
+	"golang.org/x/tools/internal/lsp/protocol"
+	"golang.org/x/tools/internal/span"
 	errors "golang.org/x/xerrors"
 )
 
 // ReferenceInfo holds information about reference to an identifier in Go source.
 type ReferenceInfo struct {
 	Name string
-	mappedRange
+	MappedRange
 	ident         *ast.Ident
 	obj           types.Object
 	pkg           Package
@@ -28,81 +29,157 @@ type ReferenceInfo struct {
 
 // References returns a list of references for a given identifier within the packages
 // containing i.File. Declarations appear first in the result.
-func (i *IdentifierInfo) References(ctx context.Context) ([]*ReferenceInfo, error) {
-	ctx, done := trace.StartSpan(ctx, "source.References")
+func References(ctx context.Context, s Snapshot, f FileHandle, pp protocol.Position, includeDeclaration bool) ([]*ReferenceInfo, error) {
+	ctx, done := event.Start(ctx, "source.References")
 	defer done()
 
-	// If the object declaration is nil, assume it is an import spec and do not look for references.
-	if i.Declaration.obj == nil {
-		return nil, errors.Errorf("no references for an import spec")
+	qualifiedObjs, err := qualifiedObjsAtProtocolPos(ctx, s, f.URI(), pp)
+	// Don't return references for builtin types.
+	if errors.Is(err, errBuiltin) {
+		return nil, nil
 	}
-	info := i.pkg.GetTypesInfo()
-	if info == nil {
-		return nil, errors.Errorf("package %s has no types info", i.pkg.PkgPath())
+	if err != nil {
+		return nil, err
 	}
-	var searchpkgs []Package
-	if i.Declaration.obj.Exported() {
-		// Only search all packages if the identifier is exported.
-		for _, id := range i.Snapshot.GetReverseDependencies(i.pkg.ID()) {
-			ph, err := i.Snapshot.PackageHandle(ctx, id)
-			if err != nil {
-				log.Error(ctx, "References: no CheckPackageHandle", err, telemetry.Package.Of(id))
-				continue
-			}
-			pkg, err := ph.Check(ctx)
-			if err != nil {
-				log.Error(ctx, "References: no Package", err, telemetry.Package.Of(id))
-				continue
-			}
-			searchpkgs = append(searchpkgs, pkg)
-		}
-	}
-	// Add the package in which the identifier is declared.
-	searchpkgs = append(searchpkgs, i.pkg)
 
-	var references []*ReferenceInfo
-	for _, pkg := range searchpkgs {
-		for ident, obj := range pkg.GetTypesInfo().Uses {
-			if !sameObj(obj, i.Declaration.obj) {
-				continue
-			}
-			rng, err := posToMappedRange(i.Snapshot.View(), pkg, ident.Pos(), ident.End())
+	refs, err := references(ctx, s, qualifiedObjs, includeDeclaration, true, false)
+	if err != nil {
+		return nil, err
+	}
+
+	toSort := refs
+	if includeDeclaration {
+		toSort = refs[1:]
+	}
+	sort.Slice(toSort, func(i, j int) bool {
+		x := CompareURI(toSort[i].URI(), toSort[j].URI())
+		if x == 0 {
+			return toSort[i].ident.Pos() < toSort[j].ident.Pos()
+		}
+		return x < 0
+	})
+	return refs, nil
+}
+
+// references is a helper function to avoid recomputing qualifiedObjsAtProtocolPos.
+func references(ctx context.Context, snapshot Snapshot, qos []qualifiedObject, includeDeclaration, includeInterfaceRefs, includeEmbeddedRefs bool) ([]*ReferenceInfo, error) {
+	var (
+		references []*ReferenceInfo
+		seen       = make(map[token.Pos]bool)
+	)
+
+	filename := snapshot.FileSet().Position(qos[0].obj.Pos()).Filename
+	pgf, err := qos[0].pkg.File(span.URIFromPath(filename))
+	if err != nil {
+		return nil, err
+	}
+	declIdent, err := findIdentifier(ctx, snapshot, qos[0].pkg, pgf, qos[0].obj.Pos())
+	if err != nil {
+		return nil, err
+	}
+	// Make sure declaration is the first item in the response.
+	if includeDeclaration {
+		references = append(references, &ReferenceInfo{
+			MappedRange:   declIdent.MappedRange,
+			Name:          qos[0].obj.Name(),
+			ident:         declIdent.ident,
+			obj:           qos[0].obj,
+			pkg:           declIdent.pkg,
+			isDeclaration: true,
+		})
+	}
+
+	for _, qo := range qos {
+		var searchPkgs []Package
+
+		// Only search dependents if the object is exported.
+		if qo.obj.Exported() {
+			reverseDeps, err := snapshot.GetReverseDependencies(ctx, qo.pkg.ID())
 			if err != nil {
 				return nil, err
 			}
-			references = append(references, &ReferenceInfo{
-				Name:        ident.Name,
-				ident:       ident,
-				pkg:         i.pkg,
-				obj:         obj,
-				mappedRange: rng,
-			})
+			searchPkgs = append(searchPkgs, reverseDeps...)
+		}
+		// Add the package in which the identifier is declared.
+		searchPkgs = append(searchPkgs, qo.pkg)
+		for _, pkg := range searchPkgs {
+			for ident, obj := range pkg.GetTypesInfo().Uses {
+				if obj != qo.obj {
+					// If ident is not a use of qo.obj, skip it, with one exception: uses
+					// of an embedded field can be considered references of the embedded
+					// type name.
+					if !includeEmbeddedRefs {
+						continue
+					}
+					v, ok := obj.(*types.Var)
+					if !ok || !v.Embedded() {
+						continue
+					}
+					named, ok := v.Type().(*types.Named)
+					if !ok || named.Obj() != qo.obj {
+						continue
+					}
+				}
+				if seen[ident.Pos()] {
+					continue
+				}
+				seen[ident.Pos()] = true
+				rng, err := posToMappedRange(snapshot, pkg, ident.Pos(), ident.End())
+				if err != nil {
+					return nil, err
+				}
+				references = append(references, &ReferenceInfo{
+					Name:        ident.Name,
+					ident:       ident,
+					pkg:         pkg,
+					obj:         obj,
+					MappedRange: rng,
+				})
+			}
 		}
 	}
+
+	// When searching on type name, don't include interface references -- they
+	// would be things like all references to Stringer for any type that
+	// happened to have a String method.
+	_, isType := declIdent.Declaration.obj.(*types.TypeName)
+	if includeInterfaceRefs && !isType {
+		declRange, err := declIdent.Range()
+		if err != nil {
+			return nil, err
+		}
+		fh, err := snapshot.GetFile(ctx, declIdent.URI())
+		if err != nil {
+			return nil, err
+		}
+		interfaceRefs, err := interfaceReferences(ctx, snapshot, fh, declRange.Start)
+		if err != nil {
+			return nil, err
+		}
+		references = append(references, interfaceRefs...)
+	}
+
 	return references, nil
 }
 
-// sameObj returns true if obj is the same as declObj.
-// Objects are the same if either they have they have objectpaths
-// and their objectpath and package are the same; or if they don't
-// have object paths and they have the same Pos and Name.
-func sameObj(obj, declObj types.Object) bool {
-	if obj == nil || declObj == nil {
-		return false
-	}
-	// TODO(suzmue): support the case where an identifier may have two different
-	// declaration positions.
-	if obj.Pkg() == nil || declObj.Pkg() == nil {
-		if obj.Pkg() != declObj.Pkg() {
-			return false
+// interfaceReferences returns the references to the interfaces implemented by
+// the type or method at the given position.
+func interfaceReferences(ctx context.Context, s Snapshot, f FileHandle, pp protocol.Position) ([]*ReferenceInfo, error) {
+	implementations, err := implementations(ctx, s, f, pp)
+	if err != nil {
+		if errors.Is(err, ErrNotAType) {
+			return nil, nil
 		}
-	} else if obj.Pkg().Path() != declObj.Pkg().Path() {
-		return false
+		return nil, err
 	}
-	objPath, operr := objectpath.For(obj)
-	declObjPath, doperr := objectpath.For(declObj)
-	if operr != nil || doperr != nil {
-		return obj.Pos() == declObj.Pos() && obj.Name() == declObj.Name()
+
+	var refs []*ReferenceInfo
+	for _, impl := range implementations {
+		implRefs, err := references(ctx, s, []qualifiedObject{impl}, false, false, false)
+		if err != nil {
+			return nil, err
+		}
+		refs = append(refs, implRefs...)
 	}
-	return objPath == declObjPath
+	return refs, nil
 }
