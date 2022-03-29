@@ -9,17 +9,25 @@ To get a specific version of `gopls` (for example, to test a prerelease
 version), run:
 
 ```sh
-GO111MODULE=on go get golang.org/x/tools/gopls@vX.Y.Z
+GO111MODULE=on go install golang.org/x/tools/gopls@vX.Y.Z
 ```
 
 Where `vX.Y.Z` is the desired version.
 
 ### Unstable versions
 
-To update `gopls` to the latest **unstable** version, use:
+To update `gopls` to the latest **unstable** version, use the following
+commands.
 
 ```sh
-GO111MODULE=on go get golang.org/x/tools/gopls@master golang.org/x/tools@master
+# Create an empty go.mod file, only for tracking requirements.
+cd $(mktemp -d)
+go mod init gopls-unstable
+
+# Use 'go get' to add requirements and to ensure they work together.
+go get -d golang.org/x/tools/gopls@master golang.org/x/tools@master
+
+go install golang.org/x/tools/gopls
 ```
 
 ## Working on the Go source distribution
@@ -36,38 +44,42 @@ editor.
 
 ## Working with generic code
 
-Gopls has experimental support for generic Go, as defined by the type
+Gopls has beta support for editing generic Go code, as defined by the type
 parameters proposal ([golang/go#43651](https://golang.org/issues/43651)) and
 type set addendum ([golang/go#45346](https://golang.org/issues/45346)).
 
-To enable this support, you need to build gopls with a version of Go that
-supports type parameters: the
-[dev.typeparams branch](https://github.com/golang/go/tree/dev.typeparams). This
-can be done by checking out this branch in the Go repository, or by using
-`golang.org/dl/gotip`:
+To enable this support, you need to **build gopls with a version of Go that
+supports generics**. The easiest way to do this is by installing the Go 1.18 Beta
+as described at
+[Tutorial: Getting started with generics#prerequisites](https://go.dev/doc/tutorial/generics),
+and then using this Go version to build gopls:
 
 ```
-$ go get golang.org/dl/gotip
-$ gotip download dev.typeparams
+$ go1.18beta2 install golang.org/x/tools/gopls@latest
 ```
 
-For building gopls with type parameter support, it is recommended that you
-build gopls at tip. External APIs are under active development on the
-`dev.typeparams` branch, so building gopls at tip minimizes the chances of
-a build failure (though it is still possible). To get enhanced gopls features
-for generic code, build gopls with the `typeparams` build constraint (though
-this increases your chances of a build failure).
+When using the Go 1.18, it is strongly recommended that you install the latest
+version of `gopls`, or the latest **unstable** version as
+[described above](#installing-unreleased-versions).
+
+You also need to make `gopls` select the beta version of `go` (in `<GOROOT>/go/bin`
+where GOROOT is the location reported by `go1.18beta2 env GOROOT`) by adding
+it to your `PATH` or by configuring your editor.
+
+The `gopls` built with these instructions understands generic code. To actually
+run the generic code you develop, you must also use the beta version of the Go
+compiler. For example:
 
 ```
-$ GO111MODULE=on gotip get -tags=typeparams golang.org/x/tools/gopls@master golang.org/x/tools@master
+$ go1.18beta2 run .
 ```
 
-This will build a version of gopls that understands generic code. To actually
-run the generic code you develop, you must also tell the compiler to speak
-generics using the `-G=3` compiler flag. For example
+### Known issues
 
-```
-$ gotip run -gcflags=-G=3 .
-```
+  * [`staticcheck`](https://github.com/golang/tools/blob/master/gopls/doc/settings.md#staticcheck-bool)
+    on generic code is not supported yet.
+
+please follow the [v0.8.0](https://github.com/golang/go/milestone/244) milestone
+to see the list of go1.18-related known issues and our progress.
 
 [Go project]: https://go.googlesource.com/go

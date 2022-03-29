@@ -28,7 +28,6 @@ import (
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/span"
-	errors "golang.org/x/xerrors"
 )
 
 var (
@@ -91,7 +90,6 @@ func parseBuffer(buf []byte) *Parsed {
 		nls:   []int{-1},
 	}
 	if len(buf) == 0 {
-		ans.ParseErr = errors.New("empty buffer")
 		return ans
 	}
 	// how to compute allAscii...
@@ -293,11 +291,12 @@ func (p *Parsed) TokenSize(t Token) (int, error) {
 	return ans, nil
 }
 
-// RuneCount counts runes in a line
+// RuneCount counts runes in line l, from col s to e
+// (e==0 for end of line. called only for multiline tokens)
 func (p *Parsed) RuneCount(l, s, e uint32) uint32 {
 	start := p.nls[l] + 1 + int(s)
-	end := int(e)
-	if e == 0 || int(e) >= p.nls[l+1] {
+	end := p.nls[l] + 1 + int(e)
+	if e == 0 || end > p.nls[l+1] {
 		end = p.nls[l+1]
 	}
 	return uint32(utf8.RuneCount(p.buf[start:end]))
@@ -357,6 +356,10 @@ func (p *Parsed) Range(x, length int) protocol.Range {
 // FromPosition translates a protocol.Position into an offset into the template
 func (p *Parsed) FromPosition(x protocol.Position) int {
 	l, c := int(x.Line), int(x.Character)
+	if l >= len(p.nls) || p.nls[l]+1 >= len(p.buf) {
+		// paranoia to avoid panic. return the largest offset
+		return len(p.buf)
+	}
 	line := p.buf[p.nls[l]+1:]
 	cnt := 0
 	for w := range string(line) {

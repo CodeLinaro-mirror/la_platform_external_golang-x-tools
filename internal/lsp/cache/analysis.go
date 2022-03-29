@@ -46,7 +46,9 @@ func (s *snapshot) Analyze(ctx context.Context, id string, analyzers []*source.A
 	for _, ah := range roots {
 		diagnostics, _, err := ah.analyze(ctx, s)
 		if err != nil {
-			return nil, err
+			// Keep going if a single analyzer failed.
+			event.Error(ctx, fmt.Sprintf("analyzer %q failed", ah.analyzer.Name), err)
+			continue
 		}
 		results = append(results, diagnostics...)
 	}
@@ -388,7 +390,7 @@ func exportedFrom(obj types.Object, pkg *types.Package) bool {
 func factType(fact analysis.Fact) reflect.Type {
 	t := reflect.TypeOf(fact)
 	if t.Kind() != reflect.Ptr {
-		panic(fmt.Sprintf("invalid Fact type: got %T, want pointer", t))
+		panic(fmt.Sprintf("invalid Fact type: got %T, want pointer", fact))
 	}
 	return t
 }

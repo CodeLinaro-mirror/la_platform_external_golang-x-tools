@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"go/types"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -149,7 +150,6 @@ type symbolCollector struct {
 	matchers   []matcherFunc
 	symbolizer symbolizer
 
-	seen map[span.URI]bool
 	symbolStore
 }
 
@@ -176,9 +176,11 @@ func newSymbolCollector(matcher SymbolMatcher, style SymbolStyle, query string) 
 func buildMatcher(matcher SymbolMatcher, query string) matcherFunc {
 	switch matcher {
 	case SymbolFuzzy:
-		return parseQuery(query)
+		return parseQuery(query, newFuzzyMatcher)
 	case SymbolFastFuzzy:
-		return fuzzy.NewSymbolMatcher(query).Match
+		return parseQuery(query, func(query string) matcherFunc {
+			return fuzzy.NewSymbolMatcher(query).Match
+		})
 	case SymbolCaseSensitive:
 		return matchExact(query)
 	case SymbolCaseInsensitive:
@@ -194,6 +196,18 @@ func buildMatcher(matcher SymbolMatcher, query string) matcherFunc {
 	panic(fmt.Errorf("unknown symbol matcher: %v", matcher))
 }
 
+func newFuzzyMatcher(query string) matcherFunc {
+	fm := fuzzy.NewMatcher(query)
+	return func(chunks []string) (int, float64) {
+		score := float64(fm.ScoreChunks(chunks))
+		ranges := fm.MatchedRanges()
+		if len(ranges) > 0 {
+			return ranges[0], score
+		}
+		return -1, score
+	}
+}
+
 // parseQuery parses a field-separated symbol query, extracting the special
 // characters listed below, and returns a matcherFunc corresponding to the AND
 // of all field queries.
@@ -206,7 +220,7 @@ func buildMatcher(matcher SymbolMatcher, query string) matcherFunc {
 // In all three of these special queries, matches are 'smart-cased', meaning
 // they are case sensitive if the symbol query contains any upper-case
 // characters, and case insensitive otherwise.
-func parseQuery(q string) matcherFunc {
+func parseQuery(q string, newMatcher func(string) matcherFunc) matcherFunc {
 	fields := strings.Fields(q)
 	if len(fields) == 0 {
 		return func([]string) (int, float64) { return -1, 0 }
@@ -237,15 +251,7 @@ func parseQuery(q string) matcherFunc {
 				return -1, 0
 			})
 		default:
-			fm := fuzzy.NewMatcher(field)
-			f = func(chunks []string) (int, float64) {
-				score := float64(fm.ScoreChunks(chunks))
-				ranges := fm.MatchedRanges()
-				if len(ranges) > 0 {
-					return ranges[0], score
-				}
-				return -1, score
-			}
+			f = newMatcher(field)
 		}
 		funcs = append(funcs, f)
 	}
@@ -296,7 +302,6 @@ func (c comboMatcher) match(chunks []string) (int, float64) {
 }
 
 func (sc *symbolCollector) walk(ctx context.Context, views []View) ([]protocol.SymbolInformation, error) {
-
 	// Use the root view URIs for determining (lexically) whether a uri is in any
 	// open workspace.
 	var roots []string
@@ -316,14 +321,22 @@ func (sc *symbolCollector) walk(ctx context.Context, views []View) ([]protocol.S
 			return nil, err
 		}
 
+		filters := v.Options().DirectoryFilters
+		folder := filepath.ToSlash(v.Folder().Filename())
 		for uri, syms := range psyms {
+			norm := filepath.ToSlash(uri.Filename())
+			nm := strings.TrimPrefix(norm, folder)
+			if FiltersDisallow(nm, filters) {
+				continue
+			}
 			// Only scan each file once.
 			if _, ok := files[uri]; ok {
 				continue
 			}
 			mds, err := snapshot.MetadataForFile(ctx, uri)
 			if err != nil {
-				return nil, err
+				event.Error(ctx, fmt.Sprintf("missing metadata for %q", uri), err)
+				continue
 			}
 			if len(mds) == 0 {
 				// TODO: should use the bug reporting API
@@ -362,6 +375,28 @@ func (sc *symbolCollector) walk(ctx context.Context, views []View) ([]protocol.S
 		}
 	}
 	return sc.results(), nil
+}
+
+// FilterDisallow is code from the body of cache.pathExcludedByFilter in cache/view.go
+// Exporting and using that function would cause an import cycle.
+// Moving it here and exporting it would leave behind view_test.go.
+// (This code is exported and used in the body of cache.pathExcludedByFilter)
+func FiltersDisallow(path string, filters []string) bool {
+	path = strings.TrimPrefix(path, "/")
+	var excluded bool
+	for _, filter := range filters {
+		op, prefix := filter[0], filter[1:]
+		// Non-empty prefixes have to be precise directory matches.
+		if prefix != "" {
+			prefix = prefix + "/"
+			path = path + "/"
+		}
+		if !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		excluded = op == '-'
+	}
+	return excluded
 }
 
 // symbolFile holds symbol information for a single file.
@@ -474,7 +509,14 @@ func (sc *symbolStore) store(si symbolInformation) {
 		return
 	}
 	insertAt := sort.Search(len(sc.res), func(i int) bool {
-		return sc.res[i].score < si.score
+		// Sort by score, then symbol length, and finally lexically.
+		if sc.res[i].score != si.score {
+			return sc.res[i].score < si.score
+		}
+		if len(sc.res[i].symbol) != len(si.symbol) {
+			return len(sc.res[i].symbol) > len(si.symbol)
+		}
+		return sc.res[i].symbol > si.symbol
 	})
 	if insertAt < len(sc.res)-1 {
 		copy(sc.res[insertAt+1:], sc.res[insertAt:len(sc.res)-1])

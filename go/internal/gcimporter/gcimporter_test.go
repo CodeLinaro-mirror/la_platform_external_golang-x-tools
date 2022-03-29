@@ -10,6 +10,7 @@ package gcimporter
 import (
 	"bytes"
 	"fmt"
+	"go/build"
 	"go/constant"
 	"go/types"
 	"io/ioutil"
@@ -30,20 +31,6 @@ func TestMain(m *testing.M) {
 }
 
 // ----------------------------------------------------------------------------
-
-// skipSpecialPlatforms causes the test to be skipped for platforms where
-// builders (build.golang.org) don't have access to compiled packages for
-// import.
-func skipSpecialPlatforms(t *testing.T) {
-	switch platform := runtime.GOOS + "-" + runtime.GOARCH; platform {
-	case "nacl-amd64p32",
-		"nacl-386",
-		"nacl-arm",
-		"darwin-arm",
-		"darwin-arm64":
-		t.Skipf("no compiled packages available for import on %s", platform)
-	}
-}
 
 func needsCompiler(t *testing.T, compiler string) {
 	if runtime.Compiler == compiler {
@@ -66,7 +53,7 @@ func compile(t *testing.T, dirname, filename, outdirname string) string {
 	}
 	basename := filepath.Base(filename)
 	outname := filepath.Join(outdirname, basename[:len(basename)-2]+"o")
-	cmd := exec.Command("go", "tool", "compile", "-o", outname, filename)
+	cmd := exec.Command("go", "tool", "compile", "-p=p", "-o", outname, filename)
 	cmd.Dir = dirname
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -162,7 +149,9 @@ func TestImportTestdata(t *testing.T) {
 }
 
 func TestVersionHandling(t *testing.T) {
-	skipSpecialPlatforms(t) // we really only need to exclude nacl platforms, but this is fine
+	if debug {
+		t.Skip("TestVersionHandling panics in debug mode")
+	}
 
 	// This package only handles gc export data.
 	needsCompiler(t, "gc")
@@ -241,8 +230,6 @@ func TestVersionHandling(t *testing.T) {
 }
 
 func TestImportStdLib(t *testing.T) {
-	skipSpecialPlatforms(t)
-
 	// This package only handles gc export data.
 	needsCompiler(t, "gc")
 
@@ -269,7 +256,7 @@ var importedObjectTests = []struct {
 	{"go/internal/gcimporter.FindPkg", "func FindPkg(path string, srcDir string) (filename string, id string)"},
 
 	// interfaces
-	{"context.Context", "type Context interface{Deadline() (deadline time.Time, ok bool); Done() <-chan struct{}; Err() error; Value(key interface{}) interface{}}"},
+	{"context.Context", "type Context interface{Deadline() (deadline time.Time, ok bool); Done() <-chan struct{}; Err() error; Value(key any) any}"},
 	{"crypto.Decrypter", "type Decrypter interface{Decrypt(rand io.Reader, msg []byte, opts DecrypterOpts) (plaintext []byte, err error); Public() PublicKey}"},
 	{"encoding.BinaryMarshaler", "type BinaryMarshaler interface{MarshalBinary() (data []byte, err error)}"},
 	{"io.Reader", "type Reader interface{Read(p []byte) (n int, err error)}"},
@@ -278,10 +265,20 @@ var importedObjectTests = []struct {
 	{"go/types.Type", "type Type interface{String() string; Underlying() Type}"},
 }
 
+// TODO(rsc): Delete this init func after x/tools no longer needs to test successfully with Go 1.17.
+func init() {
+	if build.Default.ReleaseTags[len(build.Default.ReleaseTags)-1] <= "go1.17" {
+		for i := range importedObjectTests {
+			if importedObjectTests[i].name == "context.Context" {
+				// Expand any to interface{}.
+				importedObjectTests[i].want = "type Context interface{Deadline() (deadline time.Time, ok bool); Done() <-chan struct{}; Err() error; Value(key interface{}) interface{}}"
+			}
+		}
+	}
+}
+
 func TestImportedTypes(t *testing.T) {
 	testenv.NeedsGo1Point(t, 11)
-	skipSpecialPlatforms(t)
-
 	// This package only handles gc export data.
 	needsCompiler(t, "gc")
 
@@ -291,6 +288,12 @@ func TestImportedTypes(t *testing.T) {
 			continue // error reported elsewhere
 		}
 		got := types.ObjectString(obj, types.RelativeTo(obj.Pkg()))
+
+		// TODO(rsc): Delete this block once go.dev/cl/368254 lands.
+		if got != test.want && test.want == strings.ReplaceAll(got, "interface{}", "any") {
+			got = test.want
+		}
+
 		if got != test.want {
 			t.Errorf("%s: got %q; want %q", test.name, got, test.want)
 		}
@@ -303,8 +306,6 @@ func TestImportedTypes(t *testing.T) {
 
 func TestImportedConsts(t *testing.T) {
 	testenv.NeedsGo1Point(t, 11)
-	skipSpecialPlatforms(t)
-
 	tests := []struct {
 		name string
 		want constant.Kind
@@ -386,8 +387,6 @@ func verifyInterfaceMethodRecvs(t *testing.T, named *types.Named, level int) {
 }
 
 func TestIssue5815(t *testing.T) {
-	skipSpecialPlatforms(t)
-
 	// This package only handles gc export data.
 	needsCompiler(t, "gc")
 
@@ -413,8 +412,6 @@ func TestIssue5815(t *testing.T) {
 
 // Smoke test to ensure that imported methods get the correct package.
 func TestCorrectMethodPackage(t *testing.T) {
-	skipSpecialPlatforms(t)
-
 	// This package only handles gc export data.
 	needsCompiler(t, "gc")
 
@@ -434,8 +431,6 @@ func TestCorrectMethodPackage(t *testing.T) {
 }
 
 func TestIssue13566(t *testing.T) {
-	skipSpecialPlatforms(t)
-
 	// This package only handles gc export data.
 	needsCompiler(t, "gc")
 
@@ -471,8 +466,6 @@ func TestIssue13566(t *testing.T) {
 }
 
 func TestIssue13898(t *testing.T) {
-	skipSpecialPlatforms(t)
-
 	// This package only handles gc export data.
 	needsCompiler(t, "gc")
 
@@ -515,8 +508,6 @@ func TestIssue13898(t *testing.T) {
 }
 
 func TestIssue15517(t *testing.T) {
-	skipSpecialPlatforms(t)
-
 	// This package only handles gc export data.
 	needsCompiler(t, "gc")
 
@@ -552,8 +543,6 @@ func TestIssue15517(t *testing.T) {
 }
 
 func TestIssue15920(t *testing.T) {
-	skipSpecialPlatforms(t)
-
 	// This package only handles gc export data.
 	needsCompiler(t, "gc")
 
@@ -567,8 +556,6 @@ func TestIssue15920(t *testing.T) {
 }
 
 func TestIssue20046(t *testing.T) {
-	skipSpecialPlatforms(t)
-
 	// This package only handles gc export data.
 	needsCompiler(t, "gc")
 
@@ -588,8 +575,6 @@ func TestIssue20046(t *testing.T) {
 
 func TestIssue25301(t *testing.T) {
 	testenv.NeedsGo1Point(t, 11)
-	skipSpecialPlatforms(t)
-
 	// This package only handles gc export data.
 	needsCompiler(t, "gc")
 
