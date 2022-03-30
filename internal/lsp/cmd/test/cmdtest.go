@@ -8,6 +8,7 @@ package cmdtest
 import (
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -108,6 +109,10 @@ func (r *runner) AddImport(t *testing.T, uri span.URI, expectedImport string) {
 	//TODO: import addition not supported on command line
 }
 
+func (r *runner) Hover(t *testing.T, spn span.Span, info string) {
+	//TODO: hovering not supported on command line
+}
+
 func (r *runner) runGoplsCmd(t testing.TB, args ...string) (string, string) {
 	rStdout, wStdout, err := os.Pipe()
 	if err != nil {
@@ -133,7 +138,8 @@ func (r *runner) runGoplsCmd(t testing.TB, args ...string) (string, string) {
 	os.Stdout, os.Stderr = wStdout, wStderr
 	app := cmd.New("gopls-test", r.data.Config.Dir, r.data.Exported.Config.Env, r.options)
 	remote := r.remote
-	err = tool.Run(tests.Context(t),
+	s := flag.NewFlagSet(app.Name(), flag.ExitOnError)
+	err = tool.Run(tests.Context(t), s,
 		app,
 		append([]string{fmt.Sprintf("-remote=internal@%s", remote)}, args...))
 	if err != nil {

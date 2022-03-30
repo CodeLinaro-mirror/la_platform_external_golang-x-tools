@@ -2,14 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// Code generated (see typescript/README.md) DO NOT EDIT.
+
 package protocol
 
-// Package protocol contains data types and code for LSP jsonrpcs
+// Package protocol contains data types and code for LSP json rpcs
 // generated automatically from vscode-languageserver-node
-// commit: 0cb3812e7d540ef3a904e96df795bc37a21de9b0
-// last fetched Mon Aug 02 2021 10:08:19 GMT-0400 (Eastern Daylight Time)
-
-// Code generated (see typescript/README.md) DO NOT EDIT.
+// commit: 696f9285bf849b73745682fdb1c1feac73eb8772
+// last fetched Fri Mar 04 2022 14:48:10 GMT-0500 (Eastern Standard Time)
 
 import (
 	"context"
@@ -26,13 +26,13 @@ type Client interface {
 	PublishDiagnostics(context.Context, *PublishDiagnosticsParams) error
 	Progress(context.Context, *ProgressParams) error
 	WorkspaceFolders(context.Context) ([]WorkspaceFolder /*WorkspaceFolder[] | null*/, error)
-	Configuration(context.Context, *ParamConfiguration) ([]interface{}, error)
+	Configuration(context.Context, *ParamConfiguration) ([]LSPAny, error)
 	WorkDoneProgressCreate(context.Context, *WorkDoneProgressCreateParams) error
 	ShowDocument(context.Context, *ShowDocumentParams) (*ShowDocumentResult, error)
 	RegisterCapability(context.Context, *RegistrationParams) error
 	UnregisterCapability(context.Context, *UnregistrationParams) error
 	ShowMessageRequest(context.Context, *ShowMessageRequestParams) (*MessageActionItem /*MessageActionItem | null*/, error)
-	ApplyEdit(context.Context, *ApplyWorkspaceEditParams) (*ApplyWorkspaceEditResponse, error)
+	ApplyEdit(context.Context, *ApplyWorkspaceEditParams) (*ApplyWorkspaceEditResult, error)
 }
 
 func clientDispatch(ctx context.Context, client Client, reply jsonrpc2.Replier, r jsonrpc2.Request) (bool, error) {
@@ -160,8 +160,8 @@ func (s *clientDispatcher) WorkspaceFolders(ctx context.Context) ([]WorkspaceFol
 	return result, nil
 }
 
-func (s *clientDispatcher) Configuration(ctx context.Context, params *ParamConfiguration) ([]interface{}, error) {
-	var result []interface{}
+func (s *clientDispatcher) Configuration(ctx context.Context, params *ParamConfiguration) ([]LSPAny, error) {
+	var result []LSPAny
 	if err := s.sender.Call(ctx, "workspace/configuration", params, &result); err != nil {
 		return nil, err
 	}
@@ -196,8 +196,8 @@ func (s *clientDispatcher) ShowMessageRequest(ctx context.Context, params *ShowM
 	return result, nil
 }
 
-func (s *clientDispatcher) ApplyEdit(ctx context.Context, params *ApplyWorkspaceEditParams) (*ApplyWorkspaceEditResponse, error) {
-	var result *ApplyWorkspaceEditResponse
+func (s *clientDispatcher) ApplyEdit(ctx context.Context, params *ApplyWorkspaceEditParams) (*ApplyWorkspaceEditResult, error) {
+	var result *ApplyWorkspaceEditResult
 	if err := s.sender.Call(ctx, "workspace/applyEdit", params, &result); err != nil {
 		return nil, err
 	}

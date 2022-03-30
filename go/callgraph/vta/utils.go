@@ -19,6 +19,9 @@ func isReferenceNode(n node) bool {
 	if _, ok := n.(nestedPtrInterface); ok {
 		return true
 	}
+	if _, ok := n.(nestedPtrFunction); ok {
+		return true
+	}
 
 	if _, ok := n.Type().(*types.Pointer); ok {
 		return true
@@ -33,7 +36,9 @@ func isReferenceNode(n node) bool {
 //  2) is a (nested) pointer to interface (needed for, say,
 //     slice elements of nested pointers to interface type)
 //  3) is a function type (needed for higher-order type flow)
-//  4) is a global Recover or Panic node
+//  4) is a (nested) pointer to function (needed for, say,
+//     slice elements of nested pointers to function type)
+//  5) is a global Recover or Panic node
 func hasInFlow(n node) bool {
 	if _, ok := n.(panicArg); ok {
 		return true
@@ -44,20 +49,19 @@ func hasInFlow(n node) bool {
 
 	t := n.Type()
 
-	if _, ok := t.Underlying().(*types.Signature); ok {
-		return true
-	}
-
 	if i := interfaceUnderPtr(t); i != nil {
 		return true
 	}
+	if f := functionUnderPtr(t); f != nil {
+		return true
+	}
 
-	return isInterface(t)
+	return isInterface(t) || isFunction(t)
 }
 
 // hasInitialTypes check if a node can have initial types.
 // Returns true iff `n` is not a panic or recover node as
-// those are artifical.
+// those are artificial.
 func hasInitialTypes(n node) bool {
 	switch n.(type) {
 	case panicArg, recoverReturn:
@@ -69,6 +73,11 @@ func hasInitialTypes(n node) bool {
 
 func isInterface(t types.Type) bool {
 	_, ok := t.Underlying().(*types.Interface)
+	return ok
+}
+
+func isFunction(t types.Type) bool {
+	_, ok := t.Underlying().(*types.Signature)
 	return ok
 }
 
@@ -86,6 +95,22 @@ func interfaceUnderPtr(t types.Type) types.Type {
 	}
 
 	return interfaceUnderPtr(p.Elem())
+}
+
+// functionUnderPtr checks if type `t` is a potentially nested
+// pointer to function type and if yes, returns the function type.
+// Otherwise, returns nil.
+func functionUnderPtr(t types.Type) types.Type {
+	p, ok := t.Underlying().(*types.Pointer)
+	if !ok {
+		return nil
+	}
+
+	if isFunction(p.Elem()) {
+		return p.Elem()
+	}
+
+	return functionUnderPtr(p.Elem())
 }
 
 // sliceArrayElem returns the element type of type `t` that is
@@ -114,10 +139,8 @@ func siteCallees(c ssa.CallInstruction, callgraph *callgraph.Graph) []*ssa.Funct
 	}
 
 	for _, edge := range node.Out {
-		callee := edge.Callee.Func
-		// Skip synthetic functions wrapped around source functions.
-		if edge.Site == c && callee.Synthetic == "" {
-			matches = append(matches, callee)
+		if edge.Site == c {
+			matches = append(matches, edge.Callee.Func)
 		}
 	}
 	return matches

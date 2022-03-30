@@ -11,6 +11,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"log"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"golang.org/x/tools/internal/lsp/protocol"
 	"golang.org/x/tools/internal/lsp/source"
 	"golang.org/x/tools/internal/lsp/template"
+	"golang.org/x/tools/internal/typeparams"
 	errors "golang.org/x/xerrors"
 )
 
@@ -29,6 +31,10 @@ import (
 
 // reject full semantic token requests for large files
 const maxFullFileSize int = 100000
+
+// to control comprehensive logging of decisions (gopls semtok foo.go > /dev/null shows log output)
+// semDebug should NEVER be true in checked-in code
+const semDebug = false
 
 func (s *Server) semanticTokensFull(ctx context.Context, p *protocol.SemanticTokensParams) (*protocol.SemanticTokens, error) {
 	ret, err := s.computeSemanticTokens(ctx, p.TextDocument, nil)
@@ -64,7 +70,8 @@ func (s *Server) computeSemanticTokens(ctx context.Context, td protocol.TextDocu
 		// the client won't remember the wrong answer
 		return nil, errors.Errorf("semantictokens are disabled")
 	}
-	if fh.Kind() == source.Tmpl {
+	kind := snapshot.View().FileKind(fh)
+	if kind == source.Tmpl {
 		// this is a little cumbersome to avoid both exporting 'encoded' and its methods
 		// and to avoid import cycles
 		e := &encoded{
@@ -81,14 +88,13 @@ func (s *Server) computeSemanticTokens(ctx context.Context, td protocol.TextDocu
 		}
 		return template.SemanticTokens(ctx, snapshot, fh.URI(), add, data)
 	}
-	if fh.Kind() != source.Go {
+	if kind != source.Go {
 		return nil, nil
 	}
 	pkg, err := snapshot.PackageForFile(ctx, fh.URI(), source.TypecheckFull, source.WidestPackage)
 	if err != nil {
 		return nil, err
 	}
-	info := pkg.GetTypesInfo()
 	pgf, err := pkg.File(fh.URI())
 	if err != nil {
 		return nil, err
@@ -103,7 +109,8 @@ func (s *Server) computeSemanticTokens(ctx context.Context, td protocol.TextDocu
 		ctx:      ctx,
 		pgf:      pgf,
 		rng:      rng,
-		ti:       info,
+		ti:       pkg.GetTypesInfo(),
+		pkg:      pkg,
 		fset:     snapshot.FileSet(),
 		tokTypes: s.session.Options().SemanticTypes,
 		tokMods:  s.session.Options().SemanticMods,
@@ -153,9 +160,10 @@ const (
 	tokNamespace tokenType = "namespace"
 	tokType      tokenType = "type"
 	tokInterface tokenType = "interface"
+	tokTypeParam tokenType = "typeParameter"
 	tokParameter tokenType = "parameter"
 	tokVariable  tokenType = "variable"
-	tokMember    tokenType = "member"
+	tokMethod    tokenType = "method"
 	tokFunction  tokenType = "function"
 	tokKeyword   tokenType = "keyword"
 	tokComment   tokenType = "comment"
@@ -170,7 +178,6 @@ func (e *encoded) token(start token.Pos, leng int, typ tokenType, mods []string)
 
 	if !start.IsValid() {
 		// This is not worth reporting
-		//e.unexpected("token at token.NoPos")
 		return
 	}
 	if start >= e.end || start+token.Pos(leng) <= e.start {
@@ -220,6 +227,7 @@ type encoded struct {
 	pgf               *source.ParsedGoFile
 	rng               *protocol.Range
 	ti                *types.Info
+	pkg               source.Package
 	fset              *token.FileSet
 	// allowed starting and ending token.Pos, set by init
 	// used to avoid looking at declarations not in range
@@ -231,28 +239,39 @@ type encoded struct {
 // convert the stack to a string, for debugging
 func (e *encoded) strStack() string {
 	msg := []string{"["}
-	for _, s := range e.stack {
+	for i := len(e.stack) - 1; i >= 0; i-- {
+		s := e.stack[i]
 		msg = append(msg, fmt.Sprintf("%T", s)[5:])
 	}
 	if len(e.stack) > 0 {
 		loc := e.stack[len(e.stack)-1].Pos()
 		if !source.InRange(e.pgf.Tok, loc) {
 			msg = append(msg, fmt.Sprintf("invalid position %v for %s", loc, e.pgf.URI))
-		} else {
+		} else if locInRange(e.pgf.Tok, loc) {
 			add := e.pgf.Tok.PositionFor(loc, false)
 			nm := filepath.Base(add.Filename)
 			msg = append(msg, fmt.Sprintf("(%s:%d,col:%d)", nm, add.Line, add.Column))
+		} else {
+			msg = append(msg, fmt.Sprintf("(loc %d out of range)", loc))
 		}
 	}
 	msg = append(msg, "]")
 	return strings.Join(msg, " ")
 }
 
+// avoid panic in token.PostionFor() when typing at the end of the file
+func locInRange(f *token.File, loc token.Pos) bool {
+	return f.Base() <= int(loc) && int(loc) < f.Base()+f.Size()
+}
+
 // find the line in the source
 func (e *encoded) srcLine(x ast.Node) string {
 	file := e.pgf.Tok
 	line := file.Line(x.Pos())
-	start := file.Offset(file.LineStart(line))
+	start, err := source.Offset(file, file.LineStart(line))
+	if err != nil {
+		return ""
+	}
 	end := start
 	for ; end < len(e.pgf.Src) && e.pgf.Src[end] != '\n'; end++ {
 
@@ -359,6 +378,7 @@ func (e *encoded) inspector(n ast.Node) bool {
 	case *ast.IncDecStmt:
 		e.token(x.TokPos, len(x.Tok.String()), tokOperator, nil)
 	case *ast.IndexExpr:
+	case *typeparams.IndexListExpr: // accommodate generics
 	case *ast.InterfaceType:
 		e.token(x.Interface, len("interface"), tokKeyword, nil)
 	case *ast.KeyValueExpr:
@@ -410,7 +430,7 @@ func (e *encoded) inspector(n ast.Node) bool {
 	case *ast.Comment, *ast.CommentGroup:
 		pop()
 		return false
-	default: // just to be super safe.
+	default:
 		e.unexpected(fmt.Sprintf("failed to implement %T", x))
 	}
 	return true
@@ -418,29 +438,55 @@ func (e *encoded) inspector(n ast.Node) bool {
 
 func (e *encoded) ident(x *ast.Ident) {
 	if e.ti == nil {
-		e.unkIdent(x)
+		what, mods := e.unkIdent(x)
+		if what != "" {
+			e.token(x.Pos(), len(x.String()), what, mods)
+		}
+		if semDebug {
+			log.Printf(" nil %s/nil/nil %q %v %s", x.String(), what, mods, e.strStack())
+		}
 		return
 	}
 	def := e.ti.Defs[x]
 	if def != nil {
-		what, mods := e.definitionFor(x)
+		what, mods := e.definitionFor(x, def)
 		if what != "" {
 			e.token(x.Pos(), len(x.String()), what, mods)
+		}
+		if semDebug {
+			log.Printf(" for %s/%T/%T got %s %v (%s)", x.String(), def, def.Type(), what, mods, e.strStack())
 		}
 		return
 	}
 	use := e.ti.Uses[x]
+	tok := func(pos token.Pos, lng int, tok tokenType, mods []string) {
+		e.token(pos, lng, tok, mods)
+		q := "nil"
+		if use != nil {
+			q = fmt.Sprintf("%T", use.Type())
+		}
+		if semDebug {
+			log.Printf(" use %s/%T/%s got %s %v (%s)", x.String(), use, q, tok, mods, e.strStack())
+		}
+	}
+
 	switch y := use.(type) {
 	case nil:
-		e.unkIdent(x)
+		what, mods := e.unkIdent(x)
+		if what != "" {
+			tok(x.Pos(), len(x.String()), what, mods)
+		} else if semDebug {
+			// tok() wasn't called, so didn't log
+			log.Printf(" nil %s/%T/nil %q %v (%s)", x.String(), use, what, mods, e.strStack())
+		}
 		return
 	case *types.Builtin:
-		e.token(x.NamePos, len(x.Name), tokFunction, []string{"defaultLibrary"})
+		tok(x.NamePos, len(x.Name), tokFunction, []string{"defaultLibrary"})
 	case *types.Const:
 		mods := []string{"readonly"}
 		tt := y.Type()
 		if _, ok := tt.(*types.Basic); ok {
-			e.token(x.Pos(), len(x.String()), tokVariable, mods)
+			tok(x.Pos(), len(x.String()), tokVariable, mods)
 			break
 		}
 		if ttx, ok := tt.(*types.Named); ok {
@@ -448,7 +494,7 @@ func (e *encoded) ident(x *ast.Ident) {
 				e.unexpected(fmt.Sprintf("iota:%T", ttx))
 			}
 			if _, ok := ttx.Underlying().(*types.Basic); ok {
-				e.token(x.Pos(), len(x.String()), tokVariable, mods)
+				tok(x.Pos(), len(x.String()), tokVariable, mods)
 				break
 			}
 			e.unexpected(fmt.Sprintf("%q/%T", x.String(), tt))
@@ -456,22 +502,31 @@ func (e *encoded) ident(x *ast.Ident) {
 		// can this happen? Don't think so
 		e.unexpected(fmt.Sprintf("%s %T %#v", x.String(), tt, tt))
 	case *types.Func:
-		e.token(x.Pos(), len(x.Name), tokFunction, nil)
+		tok(x.Pos(), len(x.Name), tokFunction, nil)
 	case *types.Label:
 		// nothing to map it to
 	case *types.Nil:
 		// nil is a predeclared identifier
-		e.token(x.Pos(), len("nil"), tokVariable, []string{"readonly", "defaultLibrary"})
+		tok(x.Pos(), len("nil"), tokVariable, []string{"readonly", "defaultLibrary"})
 	case *types.PkgName:
-		e.token(x.Pos(), len(x.Name), tokNamespace, nil)
-	case *types.TypeName:
+		tok(x.Pos(), len(x.Name), tokNamespace, nil)
+	case *types.TypeName: // could be a tokTpeParam
 		var mods []string
 		if _, ok := y.Type().(*types.Basic); ok {
 			mods = []string{"defaultLibrary"}
+		} else if _, ok := y.Type().(*typeparams.TypeParam); ok {
+			tok(x.Pos(), len(x.String()), tokTypeParam, mods)
+			break
 		}
-		e.token(x.Pos(), len(x.String()), tokType, mods)
+		tok(x.Pos(), len(x.String()), tokType, mods)
 	case *types.Var:
-		e.token(x.Pos(), len(x.Name), tokVariable, nil)
+		if isSignature(y) {
+			tok(x.Pos(), len(x.Name), tokFunction, nil)
+		} else if _, ok := y.Type().(*typeparams.TypeParam); ok {
+			tok(x.Pos(), len(x.Name), tokTypeParam, nil)
+		} else {
+			tok(x.Pos(), len(x.Name), tokVariable, nil)
+		}
 	default:
 		// can't happen
 		if use == nil {
@@ -486,81 +541,96 @@ func (e *encoded) ident(x *ast.Ident) {
 	}
 }
 
-// both e.ti.Defs and e.ti.Uses are nil. use the parse stack
-// a lot of these only happen when the package doesn't compile
-func (e *encoded) unkIdent(x *ast.Ident) {
-	tok := func(tok tokenType, mod []string) {
-		e.token(x.Pos(), len(x.Name), tok, mod)
+func isSignature(use types.Object) bool {
+	if true {
+		return false //PJW: fix after generics seem ok
 	}
+	if _, ok := use.(*types.Var); !ok {
+		return false
+	}
+	v := use.Type()
+	if v == nil {
+		return false
+	}
+	if _, ok := v.(*types.Signature); ok {
+		return true
+	}
+	return false
+}
+
+// both e.ti.Defs and e.ti.Uses are nil. use the parse stack.
+// a lot of these only happen when the package doesn't compile
+// but in that case it is all best-effort from the parse tree
+func (e *encoded) unkIdent(x *ast.Ident) (tokenType, []string) {
 	def := []string{"definition"}
 	n := len(e.stack) - 2 // parent of Ident
 	if n < 0 {
 		e.unexpected("no stack?")
-		return
+		return "", nil
 	}
 	switch nd := e.stack[n].(type) {
 	case *ast.BinaryExpr, *ast.UnaryExpr, *ast.ParenExpr, *ast.StarExpr,
 		*ast.IncDecStmt, *ast.SliceExpr, *ast.ExprStmt, *ast.IndexExpr,
-		*ast.ReturnStmt,
+		*ast.ReturnStmt, *ast.ChanType, *ast.SendStmt,
 		*ast.ForStmt,      // possibly incomplete
 		*ast.IfStmt,       /* condition */
 		*ast.KeyValueExpr: // either key or value
-		tok(tokVariable, nil)
+		return tokVariable, nil
+	case *typeparams.IndexListExpr: // generic?
+		return tokVariable, nil
 	case *ast.Ellipsis:
-		tok(tokType, nil)
+		return tokType, nil
 	case *ast.CaseClause:
 		if n-2 >= 0 {
 			if _, ok := e.stack[n-2].(*ast.TypeSwitchStmt); ok {
-				tok(tokType, nil)
-				return
+				return tokType, nil
 			}
 		}
-		tok(tokVariable, nil)
+		return tokVariable, nil
 	case *ast.ArrayType:
 		if x == nd.Len {
-			tok(tokVariable, nil)
+			// or maybe a Type Param, but we can't just from the parse tree
+			return tokVariable, nil
 		} else {
-			tok(tokType, nil)
+			return tokType, nil
 		}
 	case *ast.MapType:
-		tok(tokType, nil)
+		return tokType, nil
 	case *ast.CallExpr:
 		if x == nd.Fun {
-			tok(tokFunction, nil)
-			return
+			return tokFunction, nil
 		}
-		tok(tokVariable, nil)
+		return tokVariable, nil
+	case *ast.SwitchStmt:
+		return tokVariable, nil
 	case *ast.TypeAssertExpr:
 		if x == nd.X {
-			tok(tokVariable, nil)
+			return tokVariable, nil
 		} else if x == nd.Type {
-			tok(tokType, nil)
+			return tokType, nil
 		}
 	case *ast.ValueSpec:
 		for _, p := range nd.Names {
 			if p == x {
-				tok(tokVariable, def)
-				return
+				return tokVariable, def
 			}
 		}
 		for _, p := range nd.Values {
 			if p == x {
-				tok(tokVariable, nil)
-				return
+				return tokVariable, nil
 			}
 		}
-		tok(tokType, nil)
+		return tokType, nil
 	case *ast.SelectorExpr: // e.ti.Selections[nd] is nil, so no help
 		if n-1 >= 0 {
 			if ce, ok := e.stack[n-1].(*ast.CallExpr); ok {
 				// ... CallExpr SelectorExpr Ident (_.x())
 				if ce.Fun == nd && nd.Sel == x {
-					tok(tokFunction, nil)
-					return
+					return tokFunction, nil
 				}
 			}
 		}
-		tok(tokVariable, nil)
+		return tokVariable, nil
 	case *ast.AssignStmt:
 		for _, p := range nd.Lhs {
 			// x := ..., or x = ...
@@ -568,51 +638,48 @@ func (e *encoded) unkIdent(x *ast.Ident) {
 				if nd.Tok != token.DEFINE {
 					def = nil
 				}
-				tok(tokVariable, def)
-				return
+				return tokVariable, def
 			}
 		}
 		// RHS, = x
-		tok(tokVariable, nil)
+		return tokVariable, nil
 	case *ast.TypeSpec: // it's a type if it is either the Name or the Type
 		if x == nd.Type {
 			def = nil
 		}
-		tok(tokType, def)
+		return tokType, def
 	case *ast.Field:
 		// ident could be type in a field, or a method in an interface type, or a variable
 		if x == nd.Type {
-			tok(tokType, nil)
-			return
+			return tokType, nil
 		}
 		if n-2 >= 0 {
 			_, okit := e.stack[n-2].(*ast.InterfaceType)
 			_, okfl := e.stack[n-1].(*ast.FieldList)
 			if okit && okfl {
-				tok(tokMember, def)
-				return
+				return tokMethod, def
 			}
 		}
-		tok(tokVariable, nil)
+		return tokVariable, nil
 	case *ast.LabeledStmt, *ast.BranchStmt:
 		// nothing to report
 	case *ast.CompositeLit:
 		if nd.Type == x {
-			tok(tokType, nil)
-			return
+			return tokType, nil
 		}
-		tok(tokVariable, nil)
+		return tokVariable, nil
 	case *ast.RangeStmt:
 		if nd.Tok != token.DEFINE {
 			def = nil
 		}
-		tok(tokVariable, def)
+		return tokVariable, def
 	case *ast.FuncDecl:
-		tok(tokFunction, def)
+		return tokFunction, def
 	default:
 		msg := fmt.Sprintf("%T undexpected: %s %s%q", nd, x.Name, e.strStack(), e.srcLine(x))
 		e.unexpected(msg)
 	}
+	return "", nil
 }
 
 func isDeprecated(n *ast.CommentGroup) bool {
@@ -627,7 +694,9 @@ func isDeprecated(n *ast.CommentGroup) bool {
 	return false
 }
 
-func (e *encoded) definitionFor(x *ast.Ident) (tokenType, []string) {
+func (e *encoded) definitionFor(x *ast.Ident, def types.Object) (tokenType, []string) {
+	// PJW: def == types.Label? probably a nothing
+	// PJW: look into replaceing these syntactic tests with types more generally
 	mods := []string{"definition"}
 	for i := len(e.stack) - 1; i >= 0; i-- {
 		s := e.stack[i]
@@ -636,7 +705,7 @@ func (e *encoded) definitionFor(x *ast.Ident) (tokenType, []string) {
 			if x.Name == "_" {
 				return "", nil // not really a variable
 			}
-			return "variable", mods
+			return tokVariable, mods
 		case *ast.GenDecl:
 			if isDeprecated(y.Doc) {
 				mods = append(mods, "deprecated")
@@ -652,7 +721,7 @@ func (e *encoded) definitionFor(x *ast.Ident) (tokenType, []string) {
 					mods = append(mods, "deprecated")
 				}
 				if y.Recv != nil {
-					return tokMember, mods
+					return tokMethod, mods
 				}
 				return tokFunction, mods
 			}
@@ -662,8 +731,10 @@ func (e *encoded) definitionFor(x *ast.Ident) (tokenType, []string) {
 			}
 			// if x < ... < FieldList < FuncType < FuncDecl, this is a param
 			return tokParameter, mods
+		case *ast.FuncType:
+			return tokParameter, mods
 		case *ast.InterfaceType:
-			return tokMember, mods
+			return tokMethod, mods
 		case *ast.TypeSpec:
 			// GenDecl/Typespec/FuncType/FieldList/Field/Ident
 			// (type A func(b uint64)) (err error)
@@ -671,6 +742,10 @@ func (e *encoded) definitionFor(x *ast.Ident) (tokenType, []string) {
 			// and in GenDecl/TpeSpec/StructType/FieldList/Field/Ident
 			// (type A struct{b uint64}
 			// but on type B struct{C}), C is a type, but is not being defined.
+			// GenDecl/TypeSpec/FieldList/Field/Ident is a typeParam
+			if _, ok := e.stack[i+1].(*ast.FieldList); ok {
+				return tokTypeParam, mods
+			}
 			fldm := e.stack[len(e.stack)-2]
 			if fld, ok := fldm.(*ast.Field); ok {
 				// if len(fld.names) == 0 this is a tokType, being used
@@ -721,7 +796,7 @@ func (e *encoded) findKeyword(keyword string, start, end token.Pos) token.Pos {
 	if idx != -1 {
 		return start + token.Pos(idx)
 	}
-	// can't happen
+	//(in unparsable programs: type _ <-<-chan int)
 	e.unexpected(fmt.Sprintf("not found:%s %v", keyword, e.fset.PositionFor(start, false)))
 	return token.NoPos
 }
@@ -753,8 +828,12 @@ func (e *encoded) Data() []uint32 {
 	// each semantic token needs five values
 	// (see Integer Encoding for Tokens in the LSP spec)
 	x := make([]uint32, 5*len(e.items))
+	var j int
 	for i := 0; i < len(e.items); i++ {
-		j := 5 * i
+		typ, ok := typeMap[e.items[i].typeStr]
+		if !ok {
+			continue // client doesn't want typeStr
+		}
 		if i == 0 {
 			x[0] = e.items[0].line
 		} else {
@@ -765,35 +844,26 @@ func (e *encoded) Data() []uint32 {
 			x[j+1] = e.items[i].start - e.items[i-1].start
 		}
 		x[j+2] = e.items[i].len
-		typ, ok := typeMap[e.items[i].typeStr]
-		if !ok {
-			continue // client doesn't want typeStr
-		}
 		x[j+3] = uint32(typ)
 		mask := 0
 		for _, s := range e.items[i].mods {
-			// modMpa[s] is 0 if the client doesn't want this modifier
+			// modMap[s] is 0 if the client doesn't want this modifier
 			mask |= modMap[s]
 		}
 		x[j+4] = uint32(mask)
+		j += 5
 	}
-	return x
+	return x[:j]
 }
 
 func (e *encoded) importSpec(d *ast.ImportSpec) {
 	// a local package name or the last component of the Path
 	if d.Name != nil {
 		nm := d.Name.String()
-		// import . x => x is not a namespace
-		// import _ x => x is a namespace
 		if nm != "_" && nm != "." {
 			e.token(d.Name.Pos(), len(nm), tokNamespace, nil)
-			return
 		}
-		if nm == "." {
-			return
-		}
-		// and fall through for _
+		return // don't mark anything for . or _
 	}
 	val := d.Path.Value
 	if len(val) < 2 || val[0] != '"' || val[len(val)-1] != '"' {
@@ -801,15 +871,32 @@ func (e *encoded) importSpec(d *ast.ImportSpec) {
 		return
 	}
 	nm := val[1 : len(val)-1] // remove surrounding "s
-	nm = filepath.Base(nm)
-	// in import "lib/math", 'math' is the package name
-	start := d.Path.End() - token.Pos(1+len(nm))
-	e.token(start, len(nm), tokNamespace, nil)
-	// There may be more cases, as import strings are implementation defined.
+	// Import strings are implementation defined. Try to match with parse information.
+	x, err := e.pkg.GetImport(nm)
+	if err != nil {
+		// unexpected, but impact is that maybe some import is not colored
+		return
+	}
+	// expect that nm is x.PkgPath and that x.Name() is a component of it
+	if x.PkgPath() != nm {
+		// don't know how or what to color (if this can happen at all)
+		return
+	}
+	// this is not a precise test: imagine "github.com/nasty/v/v2"
+	j := strings.LastIndex(nm, x.Name())
+	if j == -1 {
+		// name doesn't show up, for whatever reason, so nothing to report
+		return
+	}
+	start := d.Path.Pos() + 1 + token.Pos(j) // skip the initial quote
+	e.token(start, len(x.Name()), tokNamespace, nil)
 }
 
 // log unexpected state
 func (e *encoded) unexpected(msg string) {
+	if semDebug {
+		panic(msg)
+	}
 	event.Error(e.ctx, e.strStack(), errors.New(msg))
 }
 
@@ -861,7 +948,7 @@ var (
 	semanticTypes = [...]string{
 		"namespace", "type", "class", "enum", "interface",
 		"struct", "typeParameter", "parameter", "variable", "property", "enumMember",
-		"event", "function", "member", "macro", "keyword", "modifier", "comment",
+		"event", "function", "method", "macro", "keyword", "modifier", "comment",
 		"string", "number", "regexp", "operator",
 	}
 	semanticModifiers = [...]string{

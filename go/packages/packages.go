@@ -26,6 +26,7 @@ import (
 	"golang.org/x/tools/go/gcexportdata"
 	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/packagesinternal"
+	"golang.org/x/tools/internal/typeparams"
 	"golang.org/x/tools/internal/typesinternal"
 )
 
@@ -37,9 +38,6 @@ import (
 // ID and Errors (if present) will always be filled.
 // Load may return more information than requested.
 type LoadMode int
-
-// TODO(matloob): When a V2 of go/packages is released, rename NeedExportsFile to
-// NeedExportFile to make it consistent with the Package field it's adding.
 
 const (
 	// NeedName adds Name and PkgPath.
@@ -58,8 +56,8 @@ const (
 	// NeedDeps adds the fields requested by the LoadMode in the packages in Imports.
 	NeedDeps
 
-	// NeedExportsFile adds ExportFile.
-	NeedExportsFile
+	// NeedExportFile adds ExportFile.
+	NeedExportFile
 
 	// NeedTypes adds Types, Fset, and IllTyped.
 	NeedTypes
@@ -79,6 +77,12 @@ const (
 
 	// NeedModule adds Module.
 	NeedModule
+
+	// NeedEmbedFiles adds EmbedFiles.
+	NeedEmbedFiles
+
+	// NeedEmbedPatterns adds EmbedPatterns.
+	NeedEmbedPatterns
 )
 
 const (
@@ -101,6 +105,9 @@ const (
 	// Deprecated: LoadAllSyntax exists for historical compatibility
 	// and should not be used. Please directly specify the needed fields using the Need values.
 	LoadAllSyntax = LoadSyntax | NeedDeps
+
+	// Deprecated: NeedExportsFile is a historical misspelling of NeedExportFile.
+	NeedExportsFile = NeedExportFile
 )
 
 // A Config specifies details about how packages should be loaded.
@@ -295,6 +302,14 @@ type Package struct {
 	// including assembly, C, C++, Fortran, Objective-C, SWIG, and so on.
 	OtherFiles []string
 
+	// EmbedFiles lists the absolute file paths of the package's files
+	// embedded with go:embed.
+	EmbedFiles []string
+
+	// EmbedPatterns lists the absolute file patterns of the package's
+	// files embedded with go:embed.
+	EmbedPatterns []string
+
 	// IgnoredFiles lists source files that are not part of the package
 	// using the current build configuration but that might be part of
 	// the package using other build configurations.
@@ -327,6 +342,9 @@ type Package struct {
 	// The NeedSyntax LoadMode bit populates this field for packages matching the patterns.
 	// If NeedDeps and NeedImports are also set, this field will also be populated
 	// for dependencies.
+	//
+	// Syntax is kept in the same order as CompiledGoFiles, with the caveat that nils are
+	// removed.  If parsing returned nil, Syntax may be shorter than CompiledGoFiles.
 	Syntax []*ast.File
 
 	// TypesInfo provides type information about the package's syntax trees.
@@ -427,6 +445,8 @@ type flatPackage struct {
 	GoFiles         []string          `json:",omitempty"`
 	CompiledGoFiles []string          `json:",omitempty"`
 	OtherFiles      []string          `json:",omitempty"`
+	EmbedFiles      []string          `json:",omitempty"`
+	EmbedPatterns   []string          `json:",omitempty"`
 	IgnoredFiles    []string          `json:",omitempty"`
 	ExportFile      string            `json:",omitempty"`
 	Imports         map[string]string `json:",omitempty"`
@@ -450,6 +470,8 @@ func (p *Package) MarshalJSON() ([]byte, error) {
 		GoFiles:         p.GoFiles,
 		CompiledGoFiles: p.CompiledGoFiles,
 		OtherFiles:      p.OtherFiles,
+		EmbedFiles:      p.EmbedFiles,
+		EmbedPatterns:   p.EmbedPatterns,
 		IgnoredFiles:    p.IgnoredFiles,
 		ExportFile:      p.ExportFile,
 	}
@@ -477,6 +499,8 @@ func (p *Package) UnmarshalJSON(b []byte) error {
 		GoFiles:         flat.GoFiles,
 		CompiledGoFiles: flat.CompiledGoFiles,
 		OtherFiles:      flat.OtherFiles,
+		EmbedFiles:      flat.EmbedFiles,
+		EmbedPatterns:   flat.EmbedPatterns,
 		ExportFile:      flat.ExportFile,
 	}
 	if len(flat.Imports) > 0 {
@@ -610,7 +634,7 @@ func (ld *loader) refine(roots []string, list ...*Package) ([]*Package, error) {
 		needsrc := ((ld.Mode&(NeedSyntax|NeedTypesInfo) != 0 && (rootIndex >= 0 || ld.Mode&NeedDeps != 0)) ||
 			// ... or if we need types and the exportData is invalid. We fall back to (incompletely)
 			// typechecking packages from source if they fail to compile.
-			(ld.Mode&NeedTypes|NeedTypesInfo != 0 && exportDataInvalid)) && pkg.PkgPath != "unsafe"
+			(ld.Mode&(NeedTypes|NeedTypesInfo) != 0 && exportDataInvalid)) && pkg.PkgPath != "unsafe"
 		lpkg := &loaderPackage{
 			Package:   pkg,
 			needtypes: needtypes,
@@ -748,13 +772,19 @@ func (ld *loader) refine(roots []string, list ...*Package) ([]*Package, error) {
 			ld.pkgs[i].OtherFiles = nil
 			ld.pkgs[i].IgnoredFiles = nil
 		}
+		if ld.requestedMode&NeedEmbedFiles == 0 {
+			ld.pkgs[i].EmbedFiles = nil
+		}
+		if ld.requestedMode&NeedEmbedPatterns == 0 {
+			ld.pkgs[i].EmbedPatterns = nil
+		}
 		if ld.requestedMode&NeedCompiledGoFiles == 0 {
 			ld.pkgs[i].CompiledGoFiles = nil
 		}
 		if ld.requestedMode&NeedImports == 0 {
 			ld.pkgs[i].Imports = nil
 		}
-		if ld.requestedMode&NeedExportsFile == 0 {
+		if ld.requestedMode&NeedExportFile == 0 {
 			ld.pkgs[i].ExportFile = ""
 		}
 		if ld.requestedMode&NeedTypes == 0 {
@@ -910,6 +940,7 @@ func (ld *loader) loadPackage(lpkg *loaderPackage) {
 		Scopes:     make(map[ast.Node]*types.Scope),
 		Selections: make(map[*ast.SelectorExpr]*types.Selection),
 	}
+	typeparams.InitInstanceInfo(lpkg.TypesInfo)
 	lpkg.TypesSizes = ld.sizes
 
 	importer := importerFunc(func(path string) (*types.Package, error) {
@@ -1206,7 +1237,7 @@ func (ld *loader) loadFromExportData(lpkg *loaderPackage) (*types.Package, error
 		return nil, fmt.Errorf("reading %s: %v", lpkg.ExportFile, err)
 	}
 	if viewLen != len(view) {
-		log.Fatalf("Unexpected package creation during export data loading")
+		log.Panicf("golang.org/x/tools/go/packages: unexpected new packages during load of %s", lpkg.PkgPath)
 	}
 
 	lpkg.Types = tpkg
@@ -1217,17 +1248,8 @@ func (ld *loader) loadFromExportData(lpkg *loaderPackage) (*types.Package, error
 
 // impliedLoadMode returns loadMode with its dependencies.
 func impliedLoadMode(loadMode LoadMode) LoadMode {
-	if loadMode&NeedTypesInfo != 0 && loadMode&NeedImports == 0 {
-		// If NeedTypesInfo, go/packages needs to do typechecking itself so it can
-		// associate type info with the AST. To do so, we need the export data
-		// for dependencies, which means we need to ask for the direct dependencies.
-		// NeedImports is used to ask for the direct dependencies.
-		loadMode |= NeedImports
-	}
-
-	if loadMode&NeedDeps != 0 && loadMode&NeedImports == 0 {
-		// With NeedDeps we need to load at least direct dependencies.
-		// NeedImports is used to ask for the direct dependencies.
+	if loadMode&(NeedDeps|NeedTypes|NeedTypesInfo) != 0 {
+		// All these things require knowing the import graph.
 		loadMode |= NeedImports
 	}
 
@@ -1235,5 +1257,5 @@ func impliedLoadMode(loadMode LoadMode) LoadMode {
 }
 
 func usesExportData(cfg *Config) bool {
-	return cfg.Mode&NeedExportsFile != 0 || cfg.Mode&NeedTypes != 0 && cfg.Mode&NeedDeps == 0
+	return cfg.Mode&NeedExportFile != 0 || cfg.Mode&NeedTypes != 0 && cfg.Mode&NeedDeps == 0
 }

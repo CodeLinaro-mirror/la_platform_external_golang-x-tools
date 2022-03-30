@@ -215,7 +215,7 @@ var (
 // every package that the file belongs to, in every typechecking mode
 // applicable.
 func qualifiedObjsAtProtocolPos(ctx context.Context, s Snapshot, uri span.URI, pp protocol.Position) ([]qualifiedObject, error) {
-	pkgs, err := s.PackagesForFile(ctx, uri, TypecheckAll)
+	pkgs, err := s.PackagesForFile(ctx, uri, TypecheckAll, false)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +223,6 @@ func qualifiedObjsAtProtocolPos(ctx context.Context, s Snapshot, uri span.URI, p
 		return nil, errNoObjectFound
 	}
 	pkg := pkgs[0]
-	var offset int
 	pgf, err := pkg.File(uri)
 	if err != nil {
 		return nil, err
@@ -236,7 +235,10 @@ func qualifiedObjsAtProtocolPos(ctx context.Context, s Snapshot, uri span.URI, p
 	if err != nil {
 		return nil, err
 	}
-	offset = pgf.Tok.Offset(rng.Start)
+	offset, err := Offset(pgf.Tok, rng.Start)
+	if err != nil {
+		return nil, err
+	}
 	return qualifiedObjsAtLocation(ctx, s, objSearchKey{uri, offset}, map[objSearchKey]bool{})
 }
 
@@ -262,7 +264,7 @@ func qualifiedObjsAtLocation(ctx context.Context, s Snapshot, key objSearchKey, 
 	// try to be comprehensive in case we ever support variations on build
 	// constraints.
 
-	pkgs, err := s.PackagesForFile(ctx, key.uri, TypecheckAll)
+	pkgs, err := s.PackagesForFile(ctx, key.uri, TypecheckAll, false)
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +352,11 @@ func qualifiedObjsAtLocation(ctx context.Context, s Snapshot, key objSearchKey, 
 			offset := -1
 			for _, pgf := range pkg.CompiledGoFiles() {
 				if pgf.Tok.Base() <= int(pos) && int(pos) <= pgf.Tok.Base()+pgf.Tok.Size() {
-					offset = pgf.Tok.Offset(pos)
+					var err error
+					offset, err = Offset(pgf.Tok, pos)
+					if err != nil {
+						return nil, err
+					}
 					uri = pgf.URI
 				}
 			}

@@ -190,6 +190,25 @@ func (l nestedPtrInterface) String() string {
 	return fmt.Sprintf("PtrInterface(%v)", l.typ)
 }
 
+// nestedPtrFunction node represents all references and dereferences of locals
+// and globals that have a nested pointer to function type. We merge such
+// constructs into a single node for simplicity and without much precision
+// sacrifice as such variables are rare in practice. Both a and b would be
+// represented as the same PtrFunction(func()) node in:
+//   var a *func()
+//   var b **func()
+type nestedPtrFunction struct {
+	typ types.Type
+}
+
+func (p nestedPtrFunction) Type() types.Type {
+	return p.typ
+}
+
+func (p nestedPtrFunction) String() string {
+	return fmt.Sprintf("PtrFunction(%v)", p.typ)
+}
+
 // panicArg models types of all arguments passed to panic.
 type panicArg struct{}
 
@@ -554,6 +573,13 @@ func (b *builder) call(c ssa.CallInstruction) {
 }
 
 func addArgumentFlows(b *builder, c ssa.CallInstruction, f *ssa.Function) {
+	// When f has no paremeters (including receiver), there is no type
+	// flow here. Also, f's body and parameters might be missing, such
+	// as when vta is used within the golang.org/x/tools/go/analysis
+	// framework (see github.com/golang/go/issues/50670).
+	if len(f.Params) == 0 {
+		return
+	}
 	cc := c.Common()
 	// When c is an unresolved method call (cc.Method != nil), cc.Value contains
 	// the receiver object rather than cc.Args[0].
@@ -566,6 +592,14 @@ func addArgumentFlows(b *builder, c ssa.CallInstruction, f *ssa.Function) {
 		offset = 1
 	}
 	for i, v := range cc.Args {
+		// Parameters of f might not be available, as in the case
+		// when vta is used within the golang.org/x/tools/go/analysis
+		// framework (see github.com/golang/go/issues/50670).
+		//
+		// TODO: investigate other cases of missing body and parameters
+		if len(f.Params) <= i+offset {
+			return
+		}
 		b.addInFlowAliasEdges(b.nodeFromVal(f.Params[i+offset]), b.nodeFromVal(v))
 	}
 }
@@ -606,7 +640,7 @@ func addReturnFlows(b *builder, r *ssa.Return, site ssa.Value) {
 
 // addInFlowEdge adds s -> d to g if d is node that can have an inflow, i.e., a node
 // that represents an interface or an unresolved function value. Otherwise, there
-// is no interesting type flow so the edge is ommited.
+// is no interesting type flow so the edge is omitted.
 func (b *builder) addInFlowEdge(s, d node) {
 	if hasInFlow(d) {
 		b.graph.addEdge(b.representative(s), b.representative(d))
@@ -615,11 +649,15 @@ func (b *builder) addInFlowEdge(s, d node) {
 
 // Creates const, pointer, global, func, and local nodes based on register instructions.
 func (b *builder) nodeFromVal(val ssa.Value) node {
-	if p, ok := val.Type().(*types.Pointer); ok && !isInterface(p.Elem()) {
+	if p, ok := val.Type().(*types.Pointer); ok && !isInterface(p.Elem()) && !isFunction(p.Elem()) {
 		// Nested pointer to interfaces are modeled as a special
 		// nestedPtrInterface node.
 		if i := interfaceUnderPtr(p.Elem()); i != nil {
 			return nestedPtrInterface{typ: i}
+		}
+		// The same goes for nested function types.
+		if f := functionUnderPtr(p.Elem()); f != nil {
+			return nestedPtrFunction{typ: f}
 		}
 		return pointer{typ: p}
 	}
@@ -665,6 +703,8 @@ func (b *builder) representative(n node) node {
 		return channelElem{typ: t}
 	case nestedPtrInterface:
 		return nestedPtrInterface{typ: t}
+	case nestedPtrFunction:
+		return nestedPtrFunction{typ: t}
 	case field:
 		return field{StructType: canonicalize(i.StructType, &b.canon), index: i.index}
 	case indexedLocal:

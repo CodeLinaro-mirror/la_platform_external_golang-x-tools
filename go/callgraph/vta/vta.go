@@ -51,7 +51,6 @@
 // it may have. This information is then used to construct the call graph.
 // For each unresolved call site, vta uses the set of types and functions
 // reaching the node representing the call site to create a set of callees.
-
 package vta
 
 import (
@@ -62,10 +61,13 @@ import (
 )
 
 // CallGraph uses the VTA algorithm to compute call graph for all functions
-// f such that f:true is in `funcs`. VTA refines the results of 'initial'
-// callgraph and uses it to establish interprocedural data flow. VTA is
-// sound if 'initial` is sound modulo reflection and unsage. The resulting
-// callgraph does not have a root node.
+// f:true in funcs. VTA refines the results of initial call graph and uses it
+// to establish interprocedural type flow. The resulting graph does not have
+// a root node.
+//
+// CallGraph does not make any assumptions on initial types global variables
+// and function/method inputs can have. CallGraph is then sound, modulo use of
+// reflection and unsafe, if the initial call graph is sound.
 func CallGraph(funcs map[*ssa.Function]bool, initial *callgraph.Graph) *callgraph.Graph {
 	vtaG, canon := typePropGraph(funcs, initial)
 	types := propagate(vtaG, canon)
@@ -124,14 +126,14 @@ func (c *constructor) callees(call ssa.CallInstruction) []*ssa.Function {
 func resolve(c ssa.CallInstruction, types propTypeMap, cache methodCache) []*ssa.Function {
 	n := local{val: c.Common().Value}
 	var funcs []*ssa.Function
-	for p := range types.propTypes(n) {
+	for _, p := range types.propTypes(n) {
 		funcs = append(funcs, propFunc(p, c, cache)...)
 	}
 	return funcs
 }
 
 // propFunc returns the functions modeled with the propagation type `p`
-// assigned to call site `c`. If no such funciton exists, nil is returned.
+// assigned to call site `c`. If no such function exists, nil is returned.
 func propFunc(p propType, c ssa.CallInstruction, cache methodCache) []*ssa.Function {
 	if p.f != nil {
 		return []*ssa.Function{p.f}

@@ -29,6 +29,11 @@ func Format(ctx context.Context, snapshot Snapshot, fh FileHandle) ([]protocol.T
 	ctx, done := event.Start(ctx, "source.Format")
 	defer done()
 
+	// Generated files shouldn't be edited. So, don't format them
+	if IsGenerated(ctx, snapshot, fh.URI()) {
+		return nil, fmt.Errorf("can't format %q: file is generated", fh.URI().Filename())
+	}
+
 	pgf, err := snapshot.ParseGo(ctx, fh, ParseFull)
 	if err != nil {
 		return nil, err
@@ -58,8 +63,24 @@ func Format(ctx context.Context, snapshot Snapshot, fh FileHandle) ([]protocol.T
 
 	// Apply additional formatting, if any is supported. Currently, the only
 	// supported additional formatter is gofumpt.
-	if format := snapshot.View().Options().Hooks.GofumptFormat; snapshot.View().Options().Gofumpt && format != nil {
-		b, err := format(ctx, buf.Bytes())
+	if format := snapshot.View().Options().GofumptFormat; snapshot.View().Options().Gofumpt && format != nil {
+		// gofumpt can customize formatting based on language version and module
+		// path, if available.
+		//
+		// Try to derive this information, but fall-back on the default behavior.
+		//
+		// TODO: under which circumstances can we fail to find module information?
+		// Can this, for example, result in inconsistent formatting across saves,
+		// due to pending calls to packages.Load?
+		var langVersion, modulePath string
+		mds, err := snapshot.MetadataForFile(ctx, fh.URI())
+		if err == nil && len(mds) > 0 {
+			if mi := mds[0].ModuleInfo(); mi != nil {
+				langVersion = mi.GoVersion
+				modulePath = mi.Path
+			}
+		}
+		b, err := format(ctx, langVersion, modulePath, buf.Bytes())
 		if err != nil {
 			return nil, err
 		}
@@ -153,7 +174,10 @@ func ComputeOneImportFixEdits(snapshot Snapshot, pgf *ParsedGoFile, fix *imports
 
 func computeFixEdits(snapshot Snapshot, pgf *ParsedGoFile, options *imports.Options, fixes []*imports.ImportFix) ([]protocol.TextEdit, error) {
 	// trim the original data to match fixedData
-	left := importPrefix(pgf.Src)
+	left, err := importPrefix(pgf.Src)
+	if err != nil {
+		return nil, err
+	}
 	extra := !strings.Contains(left, "\n") // one line may have more than imports
 	if extra {
 		left = string(pgf.Src)
@@ -185,25 +209,30 @@ func computeFixEdits(snapshot Snapshot, pgf *ParsedGoFile, options *imports.Opti
 // importPrefix returns the prefix of the given file content through the final
 // import statement. If there are no imports, the prefix is the package
 // statement and any comment groups below it.
-func importPrefix(src []byte) string {
+func importPrefix(src []byte) (string, error) {
 	fset := token.NewFileSet()
 	// do as little parsing as possible
 	f, err := parser.ParseFile(fset, "", src, parser.ImportsOnly|parser.ParseComments)
 	if err != nil { // This can happen if 'package' is misspelled
-		return ""
+		return "", fmt.Errorf("importPrefix: failed to parse: %s", err)
 	}
 	tok := fset.File(f.Pos())
 	var importEnd int
 	for _, d := range f.Decls {
 		if x, ok := d.(*ast.GenDecl); ok && x.Tok == token.IMPORT {
-			if e := tok.Offset(d.End()); e > importEnd {
+			if e, err := Offset(tok, d.End()); err != nil {
+				return "", fmt.Errorf("importPrefix: %s", err)
+			} else if e > importEnd {
 				importEnd = e
 			}
 		}
 	}
 
 	maybeAdjustToLineEnd := func(pos token.Pos, isCommentNode bool) int {
-		offset := tok.Offset(pos)
+		offset, err := Offset(tok, pos)
+		if err != nil {
+			return -1
+		}
 
 		// Don't go past the end of the file.
 		if offset > len(src) {
@@ -215,7 +244,10 @@ func importPrefix(src []byte) string {
 		// return a position on the next line whenever possible.
 		switch line := tok.Line(tok.Pos(offset)); {
 		case line < tok.LineCount():
-			nextLineOffset := tok.Offset(tok.LineStart(line + 1))
+			nextLineOffset, err := Offset(tok, tok.LineStart(line+1))
+			if err != nil {
+				return -1
+			}
 			// If we found a position that is at the end of a line, move the
 			// offset to the start of the next line.
 			if offset+1 == nextLineOffset {
@@ -234,14 +266,19 @@ func importPrefix(src []byte) string {
 	}
 	for _, cgroup := range f.Comments {
 		for _, c := range cgroup.List {
-			if end := tok.Offset(c.End()); end > importEnd {
+			if end, err := Offset(tok, c.End()); err != nil {
+				return "", err
+			} else if end > importEnd {
 				startLine := tok.Position(c.Pos()).Line
 				endLine := tok.Position(c.End()).Line
 
 				// Work around golang/go#41197 by checking if the comment might
 				// contain "\r", and if so, find the actual end position of the
 				// comment by scanning the content of the file.
-				startOffset := tok.Offset(c.Pos())
+				startOffset, err := Offset(tok, c.Pos())
+				if err != nil {
+					return "", err
+				}
 				if startLine != endLine && bytes.Contains(src[startOffset:], []byte("\r")) {
 					if commentEnd := scanForCommentEnd(src[startOffset:]); commentEnd > 0 {
 						end = startOffset + commentEnd
@@ -254,7 +291,7 @@ func importPrefix(src []byte) string {
 	if importEnd > len(src) {
 		importEnd = len(src)
 	}
-	return string(src[:importEnd])
+	return string(src[:importEnd]), nil
 }
 
 // scanForCommentEnd returns the offset of the end of the multi-line comment

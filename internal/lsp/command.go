@@ -13,9 +13,12 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"golang.org/x/mod/modfile"
+	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/lsp/command"
@@ -90,7 +93,10 @@ func (c *commandHandler) run(ctx context.Context, cfg commandConfig, run command
 		deps.snapshot, deps.fh, ok, release, err = c.s.beginFileRequest(ctx, cfg.forURI, source.UnknownKind)
 		defer release()
 		if !ok {
-			return err
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("invalid file URL: %v", cfg.forURI)
 		}
 	}
 	ctx, cancel := context.WithCancel(xcontext.Detach(ctx))
@@ -259,6 +265,26 @@ func (c *commandHandler) Vendor(ctx context.Context, args command.URIArg) error 
 	})
 }
 
+func (c *commandHandler) EditGoDirective(ctx context.Context, args command.EditGoDirectiveArgs) error {
+	return c.run(ctx, commandConfig{
+		requireSave: true, // if go.mod isn't saved it could cause a problem
+		forURI:      args.URI,
+	}, func(ctx context.Context, deps commandDeps) error {
+		snapshot, fh, ok, release, err := c.s.beginFileRequest(ctx, args.URI, source.UnknownKind)
+		defer release()
+		if !ok {
+			return err
+		}
+		if err := c.s.runGoModUpdateCommands(ctx, snapshot, fh.URI(), func(invoke func(...string) (*bytes.Buffer, error)) error {
+			_, err := invoke("mod", "edit", "-go", args.Version)
+			return err
+		}); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 func (c *commandHandler) RemoveDependency(ctx context.Context, args command.RemoveDependencyArgs) error {
 	return c.run(ctx, commandConfig{
 		progress: "Removing dependency",
@@ -358,7 +384,7 @@ func (c *commandHandler) RunTests(ctx context.Context, args command.RunTestsArgs
 
 func (c *commandHandler) runTests(ctx context.Context, snapshot source.Snapshot, work *progress.WorkDone, uri protocol.DocumentURI, tests, benchmarks []string) error {
 	// TODO: fix the error reporting when this runs async.
-	pkgs, err := snapshot.PackagesForFile(ctx, uri.SpanURI(), source.TypecheckWorkspace)
+	pkgs, err := snapshot.PackagesForFile(ctx, uri.SpanURI(), source.TypecheckWorkspace, false)
 	if err != nil {
 		return err
 	}
@@ -681,6 +707,48 @@ func (c *commandHandler) ListKnownPackages(ctx context.Context, args command.URI
 	})
 	return result, err
 }
+
+func (c *commandHandler) ListImports(ctx context.Context, args command.URIArg) (command.ListImportsResult, error) {
+	var result command.ListImportsResult
+	err := c.run(ctx, commandConfig{
+		forURI: args.URI,
+	}, func(ctx context.Context, deps commandDeps) error {
+		pkg, err := deps.snapshot.PackageForFile(ctx, args.URI.SpanURI(), source.TypecheckWorkspace, source.NarrowestPackage)
+		if err != nil {
+			return err
+		}
+		pgf, err := pkg.File(args.URI.SpanURI())
+		if err != nil {
+			return err
+		}
+		for _, group := range astutil.Imports(deps.snapshot.FileSet(), pgf.File) {
+			for _, imp := range group {
+				if imp.Path == nil {
+					continue
+				}
+				var name string
+				if imp.Name != nil {
+					name = imp.Name.Name
+				}
+				result.Imports = append(result.Imports, command.FileImport{
+					Path: source.ImportPath(imp),
+					Name: name,
+				})
+			}
+		}
+		for _, imp := range pkg.Imports() {
+			result.PackageImports = append(result.PackageImports, command.PackageImport{
+				Path: imp.PkgPath(), // This might be the vendored path under GOPATH vendoring, in which case it's a bug.
+			})
+		}
+		sort.Slice(result.PackageImports, func(i, j int) bool {
+			return result.PackageImports[i].Path < result.PackageImports[j].Path
+		})
+		return nil
+	})
+	return result, err
+}
+
 func (c *commandHandler) AddImport(ctx context.Context, args command.AddImportArgs) error {
 	return c.run(ctx, commandConfig{
 		progress: "Adding import",
@@ -701,17 +769,6 @@ func (c *commandHandler) AddImport(ctx context.Context, args command.AddImportAr
 	})
 }
 
-func (c *commandHandler) WorkspaceMetadata(ctx context.Context) (command.WorkspaceMetadataResult, error) {
-	var result command.WorkspaceMetadataResult
-	for _, view := range c.s.session.Views() {
-		result.Workspaces = append(result.Workspaces, command.Workspace{
-			Name:      view.Name(),
-			ModuleDir: view.TempWorkspace().Filename(),
-		})
-	}
-	return result, nil
-}
-
 func (c *commandHandler) StartDebugging(ctx context.Context, args command.DebuggingArgs) (result command.DebuggingResult, _ error) {
 	addr := args.Addr
 	if addr == "" {
@@ -727,4 +784,36 @@ func (c *commandHandler) StartDebugging(ctx context.Context, args command.Debugg
 	}
 	result.URLs = []string{"http://" + listenedAddr}
 	return result, nil
+}
+
+func (c *commandHandler) RunVulncheckExp(ctx context.Context, args command.VulncheckArgs) (result command.VulncheckResult, _ error) {
+	err := c.run(ctx, commandConfig{
+		progress:    "Running vulncheck",
+		requireSave: true,
+		forURI:      args.Dir, // Will dir work?
+	}, func(ctx context.Context, deps commandDeps) error {
+		view := deps.snapshot.View()
+		opts := view.Options()
+		if opts == nil || opts.Hooks.Govulncheck == nil {
+			return errors.New("vulncheck feature is not available")
+		}
+
+		buildFlags := opts.BuildFlags // XXX: is session.Options equivalent to view.Options?
+		var viewEnv []string
+		if e := opts.EnvSlice(); e != nil {
+			viewEnv = append(os.Environ(), e...)
+		}
+		cfg := &packages.Config{
+			Context:    ctx,
+			Tests:      true, // TODO(hyangah): add a field in args.
+			BuildFlags: buildFlags,
+			Env:        viewEnv,
+			Dir:        view.Folder().Filename(),
+			// TODO(hyangah): configure overlay
+		}
+		var err error
+		result, err = opts.Hooks.Govulncheck(ctx, cfg, args)
+		return err
+	})
+	return result, err
 }
