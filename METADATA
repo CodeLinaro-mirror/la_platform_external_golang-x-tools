@@ -9,11 +9,11 @@ third_party {
     type: GIT
     value: "https://go.googlesource.com/tools/"
   }
-  version: "e693fb417253d14786976bd29a456961aa8b6343"
+  version: "v0.7.0"
   license_type: NOTICE
   last_upgrade_date {
-    year: 2022
+    year: 2023
     month: 3
-    day: 29
+    day: 15
   }
 }

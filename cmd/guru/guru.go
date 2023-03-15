@@ -55,12 +55,12 @@ type queryPos struct {
 	info       *loader.PackageInfo // type info for the queried package (nil for fastQueryPos)
 }
 
-// TypeString prints type T relative to the query position.
+// typeString prints type T relative to the query position.
 func (qpos *queryPos) typeString(T types.Type) string {
 	return types.TypeString(T, types.RelativeTo(qpos.info.Pkg))
 }
 
-// ObjectString prints object obj relative to the query position.
+// objectString prints object obj relative to the query position.
 func (qpos *queryPos) objectString(obj types.Object) string {
 	return types.ObjectString(obj, types.RelativeTo(qpos.info.Pkg))
 }
@@ -207,12 +207,11 @@ func pkgContainsFile(bp *build.Package, filename string) byte {
 	return 0 // not found
 }
 
-// ParseQueryPos parses the source query position pos and returns the
+// parseQueryPos parses the source query position pos and returns the
 // AST node of the loaded program lprog that it identifies.
 // If needExact, it must identify a single AST subtree;
 // this is appropriate for queries that allow fairly arbitrary syntax,
 // e.g. "describe".
-//
 func parseQueryPos(lprog *loader.Program, pos string, needExact bool) (*queryPos, error) {
 	filename, startOffset, endOffset, err := parsePos(pos)
 	if err != nil {
@@ -331,16 +330,15 @@ func deref(typ types.Type) types.Type {
 // where location is derived from pos.
 //
 // pos must be one of:
-//    - a token.Pos, denoting a position
-//    - an ast.Node, denoting an interval
-//    - anything with a Pos() method:
-//         ssa.Member, ssa.Value, ssa.Instruction, types.Object, pointer.Label, etc.
-//    - a QueryPos, denoting the extent of the user's query.
-//    - nil, meaning no position at all.
+//   - a token.Pos, denoting a position
+//   - an ast.Node, denoting an interval
+//   - anything with a Pos() method:
+//     ssa.Member, ssa.Value, ssa.Instruction, types.Object, pointer.Label, etc.
+//   - a QueryPos, denoting the extent of the user's query.
+//   - nil, meaning no position at all.
 //
 // The output format is is compatible with the 'gnu'
 // compilation-error-regexp in Emacs' compilation mode.
-//
 func fprintf(w io.Writer, fset *token.FileSet, pos interface{}, format string, args ...interface{}) {
 	var start, end token.Pos
 	switch pos := pos.(type) {

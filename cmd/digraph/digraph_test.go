@@ -27,6 +27,7 @@ a b c
 b d
 c d
 d c
+e e
 `
 
 	for _, test := range []struct {
@@ -41,9 +42,10 @@ d c
 		{"transpose", g1, "transpose", nil, "belt pants\njacket sweater\npants shorts\nshoes pants\nshoes socks\nsweater shirt\ntie shirt\n"},
 		{"forward", g1, "forward", []string{"socks"}, "shoes\nsocks\n"},
 		{"forward multiple args", g1, "forward", []string{"socks", "sweater"}, "jacket\nshoes\nsocks\nsweater\n"},
-		{"scss", g2, "sccs", nil, "a\nb\nc d\n"},
+		{"scss", g2, "sccs", nil, "c d\ne\n"},
 		{"scc", g2, "scc", []string{"d"}, "c\nd\n"},
 		{"succs", g2, "succs", []string{"a"}, "b\nc\n"},
+		{"succs-long-token", g2 + "x " + strings.Repeat("x", 96*1024), "succs", []string{"x"}, strings.Repeat("x", 96*1024) + "\n"},
 		{"preds", g2, "preds", []string{"c"}, "a\nd\n"},
 		{"preds multiple args", g2, "preds", []string{"c", "d"}, "a\nb\nc\nd\n"},
 	} {

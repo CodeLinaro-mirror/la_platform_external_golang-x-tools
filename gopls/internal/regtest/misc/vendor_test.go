@@ -5,13 +5,11 @@
 package misc
 
 import (
-	"runtime"
 	"testing"
 
-	. "golang.org/x/tools/internal/lsp/regtest"
+	. "golang.org/x/tools/gopls/internal/lsp/regtest"
 
-	"golang.org/x/tools/internal/lsp/protocol"
-	"golang.org/x/tools/internal/testenv"
+	"golang.org/x/tools/gopls/internal/lsp/protocol"
 )
 
 const basicProxy = `
@@ -26,11 +24,6 @@ var Goodbye error
 `
 
 func TestInconsistentVendoring(t *testing.T) {
-	testenv.NeedsGo1Point(t, 14)
-	if runtime.GOOS == "windows" {
-		t.Skipf("skipping test due to flakiness on Windows: https://golang.org/issue/49646")
-	}
-
 	const pkgThatUsesVendoring = `
 -- go.mod --
 module mod.com
@@ -53,21 +46,20 @@ func _() {
 }
 `
 	WithOptions(
-		Modes(Singleton),
+		Modes(Default),
 		ProxyFiles(basicProxy),
 	).Run(t, pkgThatUsesVendoring, func(t *testing.T, env *Env) {
 		env.OpenFile("a/a1.go")
 		d := &protocol.PublishDiagnosticsParams{}
-		env.Await(
-			OnceMet(
-				env.DiagnosticAtRegexpWithMessage("go.mod", "module mod.com", "Inconsistent vendoring"),
-				ReadDiagnostics("go.mod", d),
-			),
+		env.OnceMet(
+			InitialWorkspaceLoad,
+			Diagnostics(env.AtRegexp("go.mod", "module mod.com"), WithMessage("Inconsistent vendoring")),
+			ReadDiagnostics("go.mod", d),
 		)
 		env.ApplyQuickFixes("go.mod", d.Diagnostics)
 
-		env.Await(
-			env.DiagnosticAtRegexpWithMessage("a/a1.go", `q int`, "not used"),
+		env.AfterChange(
+			Diagnostics(env.AtRegexp("a/a1.go", `q int`), WithMessage("not used")),
 		)
 	})
 }
