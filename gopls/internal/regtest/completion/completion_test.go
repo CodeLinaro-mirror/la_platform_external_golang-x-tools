@@ -9,15 +9,17 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"golang.org/x/tools/gopls/internal/hooks"
-	. "golang.org/x/tools/internal/lsp/regtest"
-
-	"golang.org/x/tools/internal/lsp/fake"
-	"golang.org/x/tools/internal/lsp/protocol"
+	. "golang.org/x/tools/gopls/internal/lsp/regtest"
+	"golang.org/x/tools/internal/bug"
 	"golang.org/x/tools/internal/testenv"
+
+	"golang.org/x/tools/gopls/internal/lsp/protocol"
 )
 
 func TestMain(m *testing.M) {
+	bug.PanicOnBugs = true
 	Main(m, hooks.Options)
 }
 
@@ -41,7 +43,6 @@ const Name = "Hello"
 `
 
 func TestPackageCompletion(t *testing.T) {
-	testenv.NeedsGo1Point(t, 14)
 	const files = `
 -- go.mod --
 module mod.com
@@ -172,41 +173,35 @@ package
 			Run(t, files, func(t *testing.T, env *Env) {
 				if tc.content != nil {
 					env.WriteWorkspaceFile(tc.filename, *tc.content)
-					env.Await(
-						env.DoneWithChangeWatchedFiles(),
-					)
+					env.Await(env.DoneWithChangeWatchedFiles())
 				}
 				env.OpenFile(tc.filename)
-				completions := env.Completion(tc.filename, env.RegexpSearch(tc.filename, tc.triggerRegexp))
+				completions := env.Completion(env.RegexpSearch(tc.filename, tc.triggerRegexp))
 
 				// Check that the completion item suggestions are in the range
-				// of the file.
-				lineCount := len(strings.Split(env.Editor.BufferText(tc.filename), "\n"))
+				// of the file. {Start,End}.Line are zero-based.
+				lineCount := len(strings.Split(env.BufferText(tc.filename), "\n"))
 				for _, item := range completions.Items {
-					if start := int(item.TextEdit.Range.Start.Line); start >= lineCount {
-						t.Fatalf("unexpected text edit range start line number: got %d, want less than %d", start, lineCount)
+					if start := int(item.TextEdit.Range.Start.Line); start > lineCount {
+						t.Fatalf("unexpected text edit range start line number: got %d, want <= %d", start, lineCount)
 					}
-					if end := int(item.TextEdit.Range.End.Line); end >= lineCount {
-						t.Fatalf("unexpected text edit range end line number: got %d, want less than %d", end, lineCount)
+					if end := int(item.TextEdit.Range.End.Line); end > lineCount {
+						t.Fatalf("unexpected text edit range end line number: got %d, want <= %d", end, lineCount)
 					}
 				}
 
 				if tc.want != nil {
-					start, end := env.RegexpRange(tc.filename, tc.editRegexp)
-					expectedRng := protocol.Range{
-						Start: fake.Pos.ToProtocolPosition(start),
-						End:   fake.Pos.ToProtocolPosition(end),
-					}
+					expectedLoc := env.RegexpSearch(tc.filename, tc.editRegexp)
 					for _, item := range completions.Items {
 						gotRng := item.TextEdit.Range
-						if expectedRng != gotRng {
+						if expectedLoc.Range != gotRng {
 							t.Errorf("unexpected completion range for completion item %s: got %v, want %v",
-								item.Label, gotRng, expectedRng)
+								item.Label, gotRng, expectedLoc.Range)
 						}
 					}
 				}
 
-				diff := compareCompletionResults(tc.want, completions.Items)
+				diff := compareCompletionLabels(tc.want, completions.Items)
 				if diff != "" {
 					t.Error(diff)
 				}
@@ -228,23 +223,18 @@ package ma
 	want := []string{"ma", "ma_test", "main", "math", "math_test"}
 	Run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile("math/add.go")
-		completions := env.Completion("math/add.go", fake.Pos{
-			Line:   0,
-			Column: 10,
-		})
+		completions := env.Completion(env.RegexpSearch("math/add.go", "package ma()"))
 
-		diff := compareCompletionResults(want, completions.Items)
+		diff := compareCompletionLabels(want, completions.Items)
 		if diff != "" {
 			t.Fatal(diff)
 		}
 	})
 }
 
-func compareCompletionResults(want []string, gotItems []protocol.CompletionItem) string {
-	if len(gotItems) != len(want) {
-		return fmt.Sprintf("got %v completion(s), want %v", len(gotItems), len(want))
-	}
-
+// TODO(rfindley): audit/clean up call sites for this helper, to ensure
+// consistent test errors.
+func compareCompletionLabels(want []string, gotItems []protocol.CompletionItem) string {
 	var got []string
 	for _, item := range gotItems {
 		got = append(got, item.Label)
@@ -254,18 +244,17 @@ func compareCompletionResults(want []string, gotItems []protocol.CompletionItem)
 		}
 	}
 
-	for i, v := range got {
-		if v != want[i] {
-			return fmt.Sprintf("%d completion result not the same: got %q, want %q", i, v, want[i])
-		}
+	if len(got) == 0 && len(want) == 0 {
+		return "" // treat nil and the empty slice as equivalent
 	}
 
+	if diff := cmp.Diff(want, got); diff != "" {
+		return fmt.Sprintf("completion item mismatch (-want +got):\n%s", diff)
+	}
 	return ""
 }
 
 func TestUnimportedCompletion(t *testing.T) {
-	testenv.NeedsGo1Point(t, 14)
-
 	const mod = `
 -- go.mod --
 module mod.com
@@ -303,19 +292,19 @@ func _() {
 		// Trigger unimported completions for the example.com/blah package.
 		env.OpenFile("main.go")
 		env.Await(env.DoneWithOpen())
-		pos := env.RegexpSearch("main.go", "ah")
-		completions := env.Completion("main.go", pos)
+		loc := env.RegexpSearch("main.go", "ah")
+		completions := env.Completion(loc)
 		if len(completions.Items) == 0 {
 			t.Fatalf("no completion items")
 		}
-		env.AcceptCompletion("main.go", pos, completions.Items[0])
+		env.AcceptCompletion(loc, completions.Items[0]) // adds blah import to main.go
 		env.Await(env.DoneWithChange())
 
 		// Trigger completions once again for the blah.<> selector.
 		env.RegexpReplace("main.go", "_ = blah", "_ = blah.")
 		env.Await(env.DoneWithChange())
-		pos = env.RegexpSearch("main.go", "\n}")
-		completions = env.Completion("main.go", pos)
+		loc = env.RegexpSearch("main.go", "\n}")
+		completions = env.Completion(loc)
 		if len(completions.Items) != 1 {
 			t.Fatalf("expected 1 completion item, got %v", len(completions.Items))
 		}
@@ -323,11 +312,11 @@ func _() {
 		if item.Label != "Name" {
 			t.Fatalf("expected completion item blah.Name, got %v", item.Label)
 		}
-		env.AcceptCompletion("main.go", pos, item)
+		env.AcceptCompletion(loc, item)
 
 		// Await the diagnostics to add example.com/blah to the go.mod file.
-		env.Await(
-			env.DiagnosticAtRegexp("main.go", `"example.com/blah"`),
+		env.AfterChange(
+			Diagnostics(env.AtRegexp("main.go", `"example.com/blah"`)),
 		)
 	})
 }
@@ -391,8 +380,8 @@ type S struct {
 
 	Run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile("foo.go")
-		completions := env.Completion("foo.go", env.RegexpSearch("foo.go", `if s\.()`))
-		diff := compareCompletionResults([]string{"i"}, completions.Items)
+		completions := env.Completion(env.RegexpSearch("foo.go", `if s\.()`))
+		diff := compareCompletionLabels([]string{"i"}, completions.Items)
 		if diff != "" {
 			t.Fatal(diff)
 		}
@@ -451,8 +440,8 @@ func _() {
 			{`var _ e = xxxx()`, []string{"xxxxc", "xxxxd", "xxxxe"}},
 		}
 		for _, tt := range tests {
-			completions := env.Completion("main.go", env.RegexpSearch("main.go", tt.re))
-			diff := compareCompletionResults(tt.want, completions.Items)
+			completions := env.Completion(env.RegexpSearch("main.go", tt.re))
+			diff := compareCompletionLabels(tt.want, completions.Items)
 			if diff != "" {
 				t.Errorf("%s: %s", tt.re, diff)
 			}
@@ -484,32 +473,30 @@ func doit() {
 `
 	Run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile("prog.go")
-		pos := env.RegexpSearch("prog.go", "if fooF")
-		pos.Column += len("if fooF")
-		completions := env.Completion("prog.go", pos)
-		diff := compareCompletionResults([]string{"fooFunc"}, completions.Items)
+		loc := env.RegexpSearch("prog.go", "if fooF")
+		loc.Range.Start.Character += uint32(protocol.UTF16Len([]byte("if fooF")))
+		completions := env.Completion(loc)
+		diff := compareCompletionLabels([]string{"fooFunc"}, completions.Items)
 		if diff != "" {
 			t.Error(diff)
 		}
 		if completions.Items[0].Tags == nil {
-			t.Errorf("expected Tags to show deprecation %#v", diff[0])
+			t.Errorf("expected Tags to show deprecation %#v", completions.Items[0].Tags)
 		}
-		pos = env.RegexpSearch("prog.go", "= badP")
-		pos.Column += len("= badP")
-		completions = env.Completion("prog.go", pos)
-		diff = compareCompletionResults([]string{"badPi"}, completions.Items)
+		loc = env.RegexpSearch("prog.go", "= badP")
+		loc.Range.Start.Character += uint32(protocol.UTF16Len([]byte("= badP")))
+		completions = env.Completion(loc)
+		diff = compareCompletionLabels([]string{"badPi"}, completions.Items)
 		if diff != "" {
 			t.Error(diff)
 		}
 		if completions.Items[0].Tags == nil {
-			t.Errorf("expected Tags to show deprecation %#v", diff[0])
+			t.Errorf("expected Tags to show deprecation %#v", completions.Items[0].Tags)
 		}
 	})
 }
 
 func TestUnimportedCompletion_VSCodeIssue1489(t *testing.T) {
-	testenv.NeedsGo1Point(t, 14)
-
 	const src = `
 -- go.mod --
 module mod.com
@@ -527,74 +514,195 @@ func main() {
 }
 `
 	WithOptions(
-		EditorConfig{WindowsLineEndings: true},
+		WindowsLineEndings(),
 	).Run(t, src, func(t *testing.T, env *Env) {
-		// Trigger unimported completions for the example.com/blah package.
+		// Trigger unimported completions for the mod.com package.
 		env.OpenFile("main.go")
 		env.Await(env.DoneWithOpen())
-		pos := env.RegexpSearch("main.go", "Sqr()")
-		completions := env.Completion("main.go", pos)
+		loc := env.RegexpSearch("main.go", "Sqr()")
+		completions := env.Completion(loc)
 		if len(completions.Items) == 0 {
 			t.Fatalf("no completion items")
 		}
-		env.AcceptCompletion("main.go", pos, completions.Items[0])
+		env.AcceptCompletion(loc, completions.Items[0])
 		env.Await(env.DoneWithChange())
-		got := env.Editor.BufferText("main.go")
+		got := env.BufferText("main.go")
 		want := "package main\r\n\r\nimport (\r\n\t\"fmt\"\r\n\t\"math\"\r\n)\r\n\r\nfunc main() {\r\n\tfmt.Println(\"a\")\r\n\tmath.Sqrt(${1:})\r\n}\r\n"
-		if got != want {
-			t.Errorf("unimported completion: got %q, want %q", got, want)
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("unimported completion (-want +got):\n%s", diff)
+		}
+	})
+}
+
+func TestPackageMemberCompletionAfterSyntaxError(t *testing.T) {
+	// This test documents the current broken behavior due to golang/go#58833.
+	const src = `
+-- go.mod --
+module mod.com
+
+go 1.14
+
+-- main.go --
+package main
+
+import "math"
+
+func main() {
+	math.Sqrt(,0)
+	math.Ldex
+}
+`
+	Run(t, src, func(t *testing.T, env *Env) {
+		env.OpenFile("main.go")
+		env.Await(env.DoneWithOpen())
+		loc := env.RegexpSearch("main.go", "Ldex()")
+		completions := env.Completion(loc)
+		if len(completions.Items) == 0 {
+			t.Fatalf("no completion items")
+		}
+		env.AcceptCompletion(loc, completions.Items[0])
+		env.Await(env.DoneWithChange())
+		got := env.BufferText("main.go")
+		// The completion of math.Ldex after the syntax error on the
+		// previous line is not "math.Ldexp" but "math.Ldexmath.Abs".
+		// (In VSCode, "Abs" wrongly appears in the completion menu.)
+		// This is a consequence of poor error recovery in the parser
+		// causing "math.Ldex" to become a BadExpr.
+		want := "package main\n\nimport \"math\"\n\nfunc main() {\n\tmath.Sqrt(,0)\n\tmath.Ldexmath.Abs(${1:})\n}\n"
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("unimported completion (-want +got):\n%s", diff)
 		}
 	})
 }
 
 func TestDefinition(t *testing.T) {
-	stuff := `
+	testenv.NeedsGo1Point(t, 17) // in go1.16, The FieldList in func x is not empty
+	files := `
 -- go.mod --
 module mod.com
 
 go 1.18
 -- a_test.go --
 package foo
-func T()
-func TestG()
-func TestM()
-func TestMi()
-func Ben()
-func Fuz()
-func Testx()
-func TestMe(t *testing.T)
-func BenchmarkFoo()
 `
-	// All those parentheses are needed for the completion code to see
-	// later lines as being definitions
 	tests := []struct {
-		pat  string
-		want []string
+		line string   // the sole line in the buffer after the package statement
+		pat  string   // the pattern to search for
+		want []string // expected completions
 	}{
-		{"T", []string{"TestXxx(t *testing.T)", "TestMain(m *testing.M)"}},
-		{"TestM", []string{"TestMain(m *testing.M)", "TestM(t *testing.T)"}},
-		{"TestMi", []string{"TestMi(t *testing.T)"}},
-		{"TestG", []string{"TestG(t *testing.T)"}},
-		{"B", []string{"BenchmarkXxx(b *testing.B)"}},
-		{"BenchmarkFoo", []string{"BenchmarkFoo(b *testing.B)"}},
-		{"F", []string{"FuzzXxx(f *testing.F)"}},
-		{"Testx", nil},
-		{"TestMe", []string{"TestMe"}},
+		{"func T", "T", []string{"TestXxx(t *testing.T)", "TestMain(m *testing.M)"}},
+		{"func T()", "T", []string{"TestMain", "Test"}},
+		{"func TestM", "TestM", []string{"TestMain(m *testing.M)", "TestM(t *testing.T)"}},
+		{"func TestM()", "TestM", []string{"TestMain"}},
+		{"func TestMi", "TestMi", []string{"TestMi(t *testing.T)"}},
+		{"func TestMi()", "TestMi", nil},
+		{"func TestG", "TestG", []string{"TestG(t *testing.T)"}},
+		{"func TestG(", "TestG", nil},
+		{"func Ben", "B", []string{"BenchmarkXxx(b *testing.B)"}},
+		{"func Ben(", "Ben", []string{"Benchmark"}},
+		{"func BenchmarkFoo", "BenchmarkFoo", []string{"BenchmarkFoo(b *testing.B)"}},
+		{"func BenchmarkFoo(", "BenchmarkFoo", nil},
+		{"func Fuz", "F", []string{"FuzzXxx(f *testing.F)"}},
+		{"func Fuz(", "Fuz", []string{"Fuzz"}},
+		{"func Testx", "Testx", nil},
+		{"func TestMe(t *testing.T)", "TestMe", nil},
+		{"func Te(t *testing.T)", "Te", []string{"TestMain", "Test"}},
 	}
 	fname := "a_test.go"
-	Run(t, stuff, func(t *testing.T, env *Env) {
+	Run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile(fname)
 		env.Await(env.DoneWithOpen())
+		for _, test := range tests {
+			env.SetBufferContent(fname, "package foo\n"+test.line)
+			loc := env.RegexpSearch(fname, test.pat)
+			loc.Range.Start.Character += uint32(protocol.UTF16Len([]byte(test.pat)))
+			completions := env.Completion(loc)
+			if diff := compareCompletionLabels(test.want, completions.Items); diff != "" {
+				t.Error(diff)
+			}
+		}
+	})
+}
+
+// Test that completing a definition replaces source text when applied, golang/go#56852.
+// Note: With go <= 1.16 the completions does not add parameters and fails these tests.
+func TestDefinitionReplaceRange(t *testing.T) {
+	testenv.NeedsGo1Point(t, 17)
+
+	const mod = `
+-- go.mod --
+module mod.com
+
+go 1.17
+`
+
+	tests := []struct {
+		name          string
+		before, after string
+	}{
+		{
+			name: "func TestMa",
+			before: `
+package foo_test
+
+func TestMa
+`,
+			after: `
+package foo_test
+
+func TestMain(m *testing.M)
+`,
+		},
+		{
+			name: "func TestSome",
+			before: `
+package foo_test
+
+func TestSome
+`,
+			after: `
+package foo_test
+
+func TestSome(t *testing.T)
+`,
+		},
+		{
+			name: "func Bench",
+			before: `
+package foo_test
+
+func Bench
+`,
+			// Note: Snippet with escaped }.
+			after: `
+package foo_test
+
+func Benchmark${1:Xxx}(b *testing.B) {
+	$0
+\}
+`,
+		},
+	}
+
+	Run(t, mod, func(t *testing.T, env *Env) {
+		env.CreateBuffer("foo_test.go", "")
+
 		for _, tst := range tests {
-			pos := env.RegexpSearch(fname, tst.pat)
-			pos.Column += len(tst.pat)
-			completions := env.Completion(fname, pos)
-			result := compareCompletionResults(tst.want, completions.Items)
-			if result != "" {
-				t.Errorf("%s failed: %s:%q", tst.pat, result, tst.want)
-				for i, it := range completions.Items {
-					t.Errorf("%d got %q %q", i, it.Label, it.Detail)
-				}
+			tst.before = strings.Trim(tst.before, "\n")
+			tst.after = strings.Trim(tst.after, "\n")
+			env.SetBufferContent("foo_test.go", tst.before)
+
+			loc := env.RegexpSearch("foo_test.go", tst.name)
+			loc.Range.Start.Character = uint32(protocol.UTF16Len([]byte(tst.name)))
+			completions := env.Completion(loc)
+			if len(completions.Items) == 0 {
+				t.Fatalf("no completion items")
+			}
+
+			env.AcceptCompletion(loc, completions.Items[0])
+			env.Await(env.DoneWithChange())
+			if buf := env.BufferText("foo_test.go"); buf != tst.after {
+				t.Errorf("%s:incorrect completion: got %q, want %q", tst.name, buf, tst.after)
 			}
 		}
 	})
@@ -636,8 +744,8 @@ use ./dir/foobar/
 			{`use ./dir/foobar/()`, []string{}},
 		}
 		for _, tt := range tests {
-			completions := env.Completion("go.work", env.RegexpSearch("go.work", tt.re))
-			diff := compareCompletionResults(tt.want, completions.Items)
+			completions := env.Completion(env.RegexpSearch("go.work", tt.re))
+			diff := compareCompletionLabels(tt.want, completions.Items)
 			if diff != "" {
 				t.Errorf("%s: %s", tt.re, diff)
 			}

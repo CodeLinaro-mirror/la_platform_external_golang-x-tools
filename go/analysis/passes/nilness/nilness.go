@@ -15,6 +15,7 @@ import (
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/internal/typeparams"
 )
 
 const Doc = `check for redundant or impossible nil comparisons
@@ -102,8 +103,11 @@ func runFunc(pass *analysis.Pass, fn *ssa.Function) {
 		for _, instr := range b.Instrs {
 			switch instr := instr.(type) {
 			case ssa.CallInstruction:
-				notNil(stack, instr, instr.Common().Value,
-					instr.Common().Description())
+				// A nil receiver may be okay for type params.
+				cc := instr.Common()
+				if !(cc.IsInvoke() && typeparams.IsTypeParam(cc.Value.Type())) {
+					notNil(stack, instr, cc.Value, cc.Description())
+				}
 			case *ssa.FieldAddr:
 				notNil(stack, instr, instr.X, "field selection")
 			case *ssa.IndexAddr:
@@ -250,7 +254,7 @@ func (n nilness) String() string { return nilnessStrings[n+1] }
 // or unknown given the dominating stack of facts.
 func nilnessOf(stack []fact, v ssa.Value) nilness {
 	switch v := v.(type) {
-	// unwrap ChangeInterface values recursively, to detect if underlying
+	// unwrap ChangeInterface and Slice values recursively, to detect if underlying
 	// values have any facts recorded or are otherwise known with regard to nilness.
 	//
 	// This work must be in addition to expanding facts about
@@ -261,6 +265,10 @@ func nilnessOf(stack []fact, v ssa.Value) nilness {
 	// underlying values, rather than outer values, when the analysis is
 	// transitive in both directions.
 	case *ssa.ChangeInterface:
+		if underlying := nilnessOf(stack, v.X); underlying != unknown {
+			return underlying
+		}
+	case *ssa.Slice:
 		if underlying := nilnessOf(stack, v.X); underlying != unknown {
 			return underlying
 		}
@@ -302,9 +310,9 @@ func nilnessOf(stack []fact, v ssa.Value) nilness {
 		return isnonnil
 	case *ssa.Const:
 		if v.IsNil() {
-			return isnil
+			return isnil // nil or zero value of a pointer-like type
 		} else {
-			return isnonnil
+			return unknown // non-pointer
 		}
 	}
 

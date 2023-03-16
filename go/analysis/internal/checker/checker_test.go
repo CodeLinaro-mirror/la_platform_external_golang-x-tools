@@ -19,13 +19,8 @@ import (
 	"golang.org/x/tools/internal/testenv"
 )
 
-var from, to string
-
 func TestApplyFixes(t *testing.T) {
 	testenv.NeedsGoPackages(t)
-
-	from = "bar"
-	to = "baz"
 
 	files := map[string]string{
 		"rename/test.go": `package rename
@@ -74,26 +69,55 @@ var analyzer = &analysis.Analyzer{
 	Run:      run,
 }
 
+var other = &analysis.Analyzer{ // like analyzer but with a different Name.
+	Name:     "other",
+	Requires: []*analysis.Analyzer{inspect.Analyzer},
+	Run:      run,
+}
+
 func run(pass *analysis.Pass) (interface{}, error) {
+	const (
+		from      = "bar"
+		to        = "baz"
+		conflict  = "conflict"  // add conflicting edits to package conflict.
+		duplicate = "duplicate" // add duplicate edits to package conflict.
+		other     = "other"     // add conflicting edits to package other from different analyzers.
+	)
+
+	if pass.Analyzer.Name == other {
+		if pass.Pkg.Name() != other {
+			return nil, nil // only apply Analyzer other to packages named other
+		}
+	}
+
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 	nodeFilter := []ast.Node{(*ast.Ident)(nil)}
 	inspect.Preorder(nodeFilter, func(n ast.Node) {
 		ident := n.(*ast.Ident)
 		if ident.Name == from {
 			msg := fmt.Sprintf("renaming %q to %q", from, to)
+			edits := []analysis.TextEdit{
+				{Pos: ident.Pos(), End: ident.End(), NewText: []byte(to)},
+			}
+			switch pass.Pkg.Name() {
+			case conflict:
+				edits = append(edits, []analysis.TextEdit{
+					{Pos: ident.Pos() - 1, End: ident.End(), NewText: []byte(to)},
+					{Pos: ident.Pos(), End: ident.End() - 1, NewText: []byte(to)},
+					{Pos: ident.Pos(), End: ident.End(), NewText: []byte("lorem ipsum")},
+				}...)
+			case duplicate:
+				edits = append(edits, edits...)
+			case other:
+				if pass.Analyzer.Name == other {
+					edits[0].Pos = edits[0].Pos + 1 // shift by one to mismatch analyzer and other
+				}
+			}
 			pass.Report(analysis.Diagnostic{
-				Pos:     ident.Pos(),
-				End:     ident.End(),
-				Message: msg,
-				SuggestedFixes: []analysis.SuggestedFix{{
-					Message: msg,
-					TextEdits: []analysis.TextEdit{{
-						Pos:     ident.Pos(),
-						End:     ident.End(),
-						NewText: []byte(to),
-					}},
-				}},
-			})
+				Pos:            ident.Pos(),
+				End:            ident.End(),
+				Message:        msg,
+				SuggestedFixes: []analysis.SuggestedFix{{Message: msg, TextEdits: edits}}})
 		}
 	})
 
@@ -129,6 +153,18 @@ func Foo(s string) int {
 		RunDespiteErrors: true,
 	}
 
+	// A no-op analyzer that should finish regardless of
+	// parse or type errors in the code.
+	noopWithFact := &analysis.Analyzer{
+		Name:     "noopfact",
+		Requires: []*analysis.Analyzer{inspect.Analyzer},
+		Run: func(pass *analysis.Pass) (interface{}, error) {
+			return nil, nil
+		},
+		RunDespiteErrors: true,
+		FactTypes:        []analysis.Fact{&EmptyFact{}},
+	}
+
 	for _, test := range []struct {
 		name      string
 		pattern   []string
@@ -137,7 +173,17 @@ func Foo(s string) int {
 	}{
 		// parse/type errors
 		{name: "skip-error", pattern: []string{"file=" + path}, analyzers: []*analysis.Analyzer{analyzer}, code: 1},
-		{name: "despite-error", pattern: []string{"file=" + path}, analyzers: []*analysis.Analyzer{noop}, code: 0},
+		// RunDespiteErrors allows a driver to run an Analyzer even after parse/type errors.
+		//
+		// The noop analyzer doesn't use facts, so the driver loads only the root
+		// package from source. For the rest, it asks 'go list' for export data,
+		// which fails because the compiler encounters the type error.  Since the
+		// errors come from 'go list', the driver doesn't run the analyzer.
+		{name: "despite-error", pattern: []string{"file=" + path}, analyzers: []*analysis.Analyzer{noop}, code: 1},
+		// The noopfact analyzer does use facts, so the driver loads source for
+		// all dependencies, does type checking itself, recognizes the error as a
+		// type error, and runs the analyzer.
+		{name: "despite-error-fact", pattern: []string{"file=" + path}, analyzers: []*analysis.Analyzer{noopWithFact}, code: 0},
 		// combination of parse/type errors and no errors
 		{name: "despite-error-and-no-error", pattern: []string{"file=" + path, "sort"}, analyzers: []*analysis.Analyzer{analyzer, noop}, code: 1},
 		// non-existing package error
@@ -151,6 +197,10 @@ func Foo(s string) int {
 		// no errors
 		{name: "no-errors", pattern: []string{"sort"}, analyzers: []*analysis.Analyzer{analyzer, noop}, code: 0},
 	} {
+		if test.name == "despite-error" && testenv.Go1Point() < 20 {
+			// The behavior in the comment on the despite-error test only occurs for Go 1.20+.
+			continue
+		}
 		if got := checker.Run(test.pattern, test.analyzers); got != test.code {
 			t.Errorf("got incorrect exit code %d for test %s; want %d", got, test.name, test.code)
 		}
@@ -158,3 +208,7 @@ func Foo(s string) int {
 
 	defer cleanup()
 }
+
+type EmptyFact struct{}
+
+func (f *EmptyFact) AFact() {}

@@ -100,6 +100,26 @@ Args:
 }
 ```
 
+### **Get known vulncheck result**
+Identifier: `gopls.fetch_vulncheck_result`
+
+Fetch the result of latest vulnerability check (`govulncheck`).
+
+Args:
+
+```
+{
+	// The file URI.
+	"URI": string,
+}
+```
+
+Result:
+
+```
+map[golang.org/x/tools/gopls/internal/lsp/protocol.DocumentURI]*golang.org/x/tools/gopls/internal/govulncheck.Result
+```
+
 ### **Toggle gc_details**
 Identifier: `gopls.gc_details`
 
@@ -124,20 +144,6 @@ Args:
 	"Dir": string,
 	// Whether to generate recursively (go generate ./...)
 	"Recursive": bool,
-}
-```
-
-### **Generate gopls.mod**
-Identifier: `gopls.generate_gopls_mod`
-
-(Re)generate the gopls.mod file for a workspace.
-
-Args:
-
-```
-{
-	// The file URI.
-	"URI": string,
 }
 ```
 
@@ -216,6 +222,23 @@ Result:
 }
 ```
 
+### **fetch memory statistics**
+Identifier: `gopls.mem_stats`
+
+Call runtime.GC multiple times and return memory statistics as reported by
+runtime.MemStats.
+
+This command is used for benchmarking, and may change in the future.
+
+Result:
+
+```
+{
+	"HeapAlloc": uint64,
+	"HeapInUse": uint64,
+}
+```
+
 ### **Regenerate cgo**
 Identifier: `gopls.regenerate_cgo`
 
@@ -247,6 +270,50 @@ Args:
 }
 ```
 
+### **Reset go.mod diagnostics**
+Identifier: `gopls.reset_go_mod_diagnostics`
+
+Reset diagnostics in the go.mod file of a module.
+
+Args:
+
+```
+{
+	"URIArg": {
+		"URI": string,
+	},
+	// Optional: source of the diagnostics to reset.
+	// If not set, all resettable go.mod diagnostics will be cleared.
+	"DiagnosticSource": string,
+}
+```
+
+### **Run govulncheck.**
+Identifier: `gopls.run_govulncheck`
+
+Run vulnerability check (`govulncheck`).
+
+Args:
+
+```
+{
+	// Any document in the directory from which govulncheck will run.
+	"URI": string,
+	// Package pattern. E.g. "", ".", "./...".
+	"Pattern": string,
+}
+```
+
+Result:
+
+```
+{
+	// Token holds the progress token for LSP workDone reporting of the vulncheck
+	// invocation.
+	"Token": interface{},
+}
+```
+
 ### **Run test(s)**
 Identifier: `gopls.run_tests`
 
@@ -262,41 +329,6 @@ Args:
 	"Tests": []string,
 	// Specific benchmarks to run, e.g. BenchmarkFoo.
 	"Benchmarks": []string,
-}
-```
-
-### **Run vulncheck (experimental)**
-Identifier: `gopls.run_vulncheck_exp`
-
-Run vulnerability check (`govulncheck`).
-
-Args:
-
-```
-{
-	// Dir is the directory from which vulncheck will run from.
-	"Dir": string,
-	// Package pattern. E.g. "", ".", "./...".
-	"Pattern": string,
-}
-```
-
-Result:
-
-```
-{
-	"Vuln": []{
-		"ID": string,
-		"Details": string,
-		"Aliases": []string,
-		"Symbol": string,
-		"PkgPath": string,
-		"ModPath": string,
-		"URL": string,
-		"CurrentVersion": string,
-		"FixedVersion": string,
-		"CallStacks": [][]golang.org/x/tools/internal/lsp/command.StackEntry,
-	},
 }
 ```
 

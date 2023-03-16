@@ -1,6 +1,6 @@
 # Settings
 
-<!--TODO: Generate this file from the documentation in golang/org/x/tools/internal/lsp/source/options.go.-->
+<!--TODO: Generate this file from the documentation in golang.org/x/tools/gopls/internal/lsp/source/options.go.-->
 
 This document describes the global settings for `gopls` inside the editor.
 The settings block will be called `"gopls"` and contains a collection of
@@ -35,6 +35,7 @@ still be able to independently override specific experimental features.
   * [Completion](#completion)
   * [Diagnostic](#diagnostic)
   * [Documentation](#documentation)
+  * [Inlayhint](#inlayhint)
   * [Navigation](#navigation)
 
 ### Build
@@ -62,15 +63,19 @@ relative to the workspace folder. They are evaluated in order, and
 the last filter that applies to a path controls whether it is included.
 The path prefix can be empty, so an initial `-` excludes everything.
 
+DirectoryFilters also supports the `**` operator to match 0 or more directories.
+
 Examples:
 
-Exclude node_modules: `-node_modules`
+Exclude node_modules at current depth: `-node_modules`
+
+Exclude node_modules at any depth: `-**/node_modules`
 
 Include only project_a: `-` (exclude everything), `+project_a`
 
 Include only project_a, but not node_modules inside it: `-`, `+project_a`, `-project_a/node_modules`
 
-Default: `["-node_modules"]`.
+Default: `["-**/node_modules"]`.
 
 #### **templateExtensions** *[]string*
 
@@ -111,29 +116,6 @@ a go.mod file, narrowing the scope to that directory if it exists.
 
 Default: `true`.
 
-#### **experimentalWorkspaceModule** *bool*
-
-**This setting is experimental and may be deleted.**
-
-experimentalWorkspaceModule opts a user into the experimental support
-for multi-module workspaces.
-
-Default: `false`.
-
-#### **experimentalPackageCacheKey** *bool*
-
-**This setting is experimental and may be deleted.**
-
-experimentalPackageCacheKey controls whether to use a coarser cache key
-for package type information to increase cache hits. This setting removes
-the user's environment, build flags, and working directory from the cache
-key, which should be a safe change as all relevant inputs into the type
-checking pass are already hashed into the key. This is temporarily guarded
-by an experiment because caching behavior is subtle and difficult to
-comprehensively test.
-
-Default: `true`.
-
 #### **allowModfileModifications** *bool*
 
 **This setting is experimental and may be deleted.**
@@ -153,16 +135,28 @@ be removed.
 
 Default: `false`.
 
-#### **experimentalUseInvalidMetadata** *bool*
+#### **standaloneTags** *[]string*
 
-**This setting is experimental and may be deleted.**
+standaloneTags specifies a set of build constraints that identify
+individual Go source files that make up the entire main package of an
+executable.
 
-experimentalUseInvalidMetadata enables gopls to fall back on outdated
-package metadata to provide editor features if the go command fails to
-load packages for some reason (like an invalid go.mod file). This will
-eventually be the default behavior, and this setting will be removed.
+A common example of standalone main files is the convention of using the
+directive `//go:build ignore` to denote files that are not intended to be
+included in any package, for example because they are invoked directly by
+the developer using `go run`.
 
-Default: `false`.
+Gopls considers a file to be a standalone main file if and only if it has
+package name "main" and has a build directive of the exact form
+"//go:build tag" or "// +build tag", where tag is among the list of tags
+configured by this setting. Notably, if the build constraint is more
+complicated than a simple tag (such as the composite constraint
+`//go:build tag && go1.18`), the file is not considered to be a standalone
+main file.
+
+This setting is only supported when gopls is built with Go 1.16 or later.
+
+Default: `["ignore"]`.
 
 ### Formatting
 
@@ -211,6 +205,22 @@ Default: `{"gc_details":false,"generate":true,"regenerate_cgo":true,"tidy":true,
 
 semanticTokens controls whether the LSP server will send
 semantic tokens to the client.
+
+Default: `false`.
+
+#### **noSemanticString** *bool*
+
+**This setting is experimental and may be deleted.**
+
+noSemanticString turns off the sending of the semantic token 'string'
+
+Default: `false`.
+
+#### **noSemanticNumber** *bool*
+
+**This setting is experimental and may be deleted.**
+
+noSemanticNumber  turns off the sending of the semantic token 'number'
 
 Default: `false`.
 
@@ -265,8 +275,8 @@ Default: `true`.
 
 analyses specify analyses that the user would like to enable or disable.
 A map of the names of analysis passes that should be enabled/disabled.
-A full list of analyzers that gopls uses can be found
-[here](https://github.com/golang/tools/blob/master/gopls/doc/analyzers.md).
+A full list of analyzers that gopls uses can be found in
+[analyzers.md](https://github.com/golang/tools/blob/master/gopls/doc/analyzers.md).
 
 Example Usage:
 
@@ -286,6 +296,8 @@ Default: `{}`.
 **This setting is experimental and may be deleted.**
 
 staticcheck enables additional analyses from staticcheck.io.
+These analyses are documented on
+[Staticcheck's website](https://staticcheck.io/docs/checks/).
 
 Default: `false`.
 
@@ -305,6 +317,20 @@ Can contain any of:
 
 Default: `{"bounds":true,"escape":true,"inline":true,"nil":true}`.
 
+##### **vulncheck** *enum*
+
+**This setting is experimental and may be deleted.**
+
+vulncheck enables vulnerability scanning.
+
+Must be one of:
+
+* `"Imports"`: In Imports mode, `gopls` will report vulnerabilities that affect packages
+directly and indirectly used by the analyzed main module.
+* `"Off"`: Disable vulnerability analysis.
+
+Default: `"Off"`.
+
 ##### **diagnosticsDelay** *time.Duration*
 
 **This is an advanced setting and should not be configured by most `gopls` users.**
@@ -317,20 +343,6 @@ on recently modified packages.
 This option must be set to a valid duration string, for example `"250ms"`.
 
 Default: `"250ms"`.
-
-##### **experimentalWatchedFileDelay** *time.Duration*
-
-**This setting is experimental and may be deleted.**
-
-experimentalWatchedFileDelay controls the amount of time that gopls waits
-for additional workspace/didChangeWatchedFiles notifications to arrive,
-before processing all such notifications in a single batch. This is
-intended for use by LSP clients that don't support their own batching of
-file system notifications.
-
-This option must be set to a valid duration string, for example `"100ms"`.
-
-Default: `"0s"`.
 
 #### Documentation
 
@@ -362,6 +374,9 @@ It might be one of:
 
 If company chooses to use its own `godoc.org`, its address can be used as well.
 
+Modules matching the GOPRIVATE environment variable will not have
+documentation links in hover.
+
 Default: `"pkg.go.dev"`.
 
 ##### **linksInHover** *bool*
@@ -369,6 +384,18 @@ Default: `"pkg.go.dev"`.
 linksInHover toggles the presence of links to documentation in hover.
 
 Default: `true`.
+
+#### Inlayhint
+
+##### **hints** *map[string]bool*
+
+**This setting is experimental and may be deleted.**
+
+hints specify inlay hints that users want to see. A full list of hints
+that gopls uses can be found in
+[inlayHints.md](https://github.com/golang/tools/blob/master/gopls/doc/inlayHints.md).
+
+Default: `{}`.
 
 #### Navigation
 
@@ -439,6 +466,17 @@ Default: `false`.
 
 <!-- END User: DO NOT MANUALLY EDIT THIS SECTION -->
 
+#### **newDiff** *string*
+
+newDiff enables the new diff implementation. If this is "both", for now both
+diffs will be run and statistics will be generated in a file in $TMPDIR. This
+is a risky setting; help in trying it is appreciated. If it is "old" the old
+implementation is used, and if it is "new", just the new implementation is
+used. This setting will eventually be deleted, once gopls has fully migrated to
+the new diff algorithm.
+
+Default: 'both'.
+
 ## Code Lenses
 
 These are the code lenses that `gopls` currently supports. They can be enabled
@@ -461,6 +499,11 @@ Runs `go generate` for a given directory.
 Identifier: `regenerate_cgo`
 
 Regenerates cgo definitions.
+### **Run govulncheck.**
+
+Identifier: `run_govulncheck`
+
+Run vulnerability check (`govulncheck`).
 ### **Run test(s) (legacy)**
 
 Identifier: `test`

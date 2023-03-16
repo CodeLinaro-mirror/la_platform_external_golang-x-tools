@@ -48,7 +48,7 @@ check for common mistakes involving boolean operators
 
 ## **buildtag**
 
-check that +build tags are well-formed and correctly located
+check //go:build and // +build directives
 
 **Enabled by default.**
 
@@ -108,6 +108,35 @@ errors is discouraged.
 
 **Enabled by default.**
 
+## **directive**
+
+check Go toolchain directives such as //go:debug
+
+This analyzer checks for problems with known Go toolchain directives
+in all Go source files in a package directory, even those excluded by
+//go:build constraints, and all non-Go source files too.
+
+For //go:debug (see https://go.dev/doc/godebug), the analyzer checks
+that the directives are placed only in Go source files, only above the
+package comment, and only in package main or *_test.go files.
+
+Support for other known directives may be added in the future.
+
+This analyzer does not check //go:build, which is handled by the
+buildtag analyzer.
+
+
+**Enabled by default.**
+
+## **embed**
+
+check for //go:embed directive import
+
+This analyzer checks that the embed package is imported when source code contains //go:embed comment directives.
+The embed package must be imported for //go:embed directives to function.import _ "embed".
+
+**Enabled by default.**
+
 ## **errorsas**
 
 report passing non-pointer or non-error values to errors.As
@@ -122,7 +151,7 @@ of the second argument is not a pointer to a type implementing error.
 find structs that would use less memory if their fields were sorted
 
 This analyzer find structs that can be rearranged to use less memory, and provides
-a suggested edit with the optimal order.
+a suggested edit with the most compact order.
 
 Note that there are two different diagnostics reported. One checks struct size,
 and the other reports "pointer bytes" used. Pointer bytes is how many bytes of the
@@ -140,6 +169,11 @@ has 24 pointer bytes because it has to scan further through the *uint32.
 	struct { string; uint32 }
 
 has 8 because it can stop immediately after the string pointer.
+
+Be aware that the most compact order is not always the most efficient.
+In rare cases it may cause two variables each updated by its own goroutine
+to occupy the same CPU cache line, inducing a form of memory contention
+known as "false sharing" that slows down both goroutines.
 
 
 **Disabled by default. Enable it by setting `"analyses": {"fieldalignment": true}`.**
@@ -204,19 +238,60 @@ inferred from function arguments, or from other type arguments:
 
 check references to loop variables from within nested functions
 
-This analyzer checks for references to loop variables from within a
-function literal inside the loop body. It checks only instances where
-the function literal is called in a defer or go statement that is the
-last statement in the loop body, as otherwise we would need whole
-program analysis.
+This analyzer reports places where a function literal references the
+iteration variable of an enclosing loop, and the loop calls the function
+in such a way (e.g. with go or defer) that it may outlive the loop
+iteration and possibly observe the wrong value of the variable.
 
-For example:
+In this example, all the deferred functions run after the loop has
+completed, so all observe the final value of v.
 
-	for i, v := range s {
-		go func() {
-			println(i, v) // not what you might expect
-		}()
-	}
+    for _, v := range list {
+        defer func() {
+            use(v) // incorrect
+        }()
+    }
+
+One fix is to create a new variable for each iteration of the loop:
+
+    for _, v := range list {
+        v := v // new var per iteration
+        defer func() {
+            use(v) // ok
+        }()
+    }
+
+The next example uses a go statement and has a similar problem.
+In addition, it has a data race because the loop updates v
+concurrent with the goroutines accessing it.
+
+    for _, v := range elem {
+        go func() {
+            use(v)  // incorrect, and a data race
+        }()
+    }
+
+A fix is the same as before. The checker also reports problems
+in goroutines started by golang.org/x/sync/errgroup.Group.
+A hard-to-spot variant of this form is common in parallel tests:
+
+    func Test(t *testing.T) {
+        for _, test := range tests {
+            t.Run(test.name, func(t *testing.T) {
+                t.Parallel()
+                use(test) // incorrect, and a data race
+            })
+        }
+    }
+
+The t.Parallel() call causes the rest of the function to execute
+concurrent with the loop.
+
+The analyzer reports references only in the last statement,
+as it is not deep enough to understand the effects of subsequent
+statements that might render the reference benign.
+("Last statement" is defined recursively in compound
+statements such as if, switch, and select.)
 
 See: https://golang.org/doc/go_faq.html#closures_and_goroutines
 
@@ -483,6 +558,17 @@ for the conventions that are enforced for Tests, Benchmarks, and Examples.
 
 **Enabled by default.**
 
+## **timeformat**
+
+check for calls of (time.Time).Format or time.Parse with 2006-02-01
+
+The timeformat checker looks for time formats with the 2006-02-01 (yyyy-dd-mm)
+format. Internationally, "yyyy-dd-mm" does not occur in common calendar date
+standards, and so it is more likely that 2006-01-02 (yyyy-mm-dd) was intended.
+
+
+**Enabled by default.**
+
 ## **unmarshal**
 
 report passing non-pointer or non-interface values to unmarshal
@@ -642,6 +728,15 @@ func <>(inferred parameters) {
 
 
 **Enabled by default.**
+
+## **unusedvariable**
+
+check for unused variables
+
+The unusedvariable analyzer suggests fixes for unused variables errors.
+
+
+**Disabled by default. Enable it by setting `"analyses": {"unusedvariable": true}`.**
 
 ## **fillstruct**
 
